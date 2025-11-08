@@ -40,7 +40,7 @@ app.post("/event", async (req, res) => {
 
     // Insert into DB
     await pool.query(
-      `INSERT INTO device_events (device_id, event_type, latitude, longitude)
+      `INSERT INTO device_logs (device_id, event_type, latitude, longitude)
        VALUES ($1, $2, $3, $4)`,
       [device_id, event_type, latitude, longitude]
     );
