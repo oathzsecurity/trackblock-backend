@@ -1,22 +1,34 @@
-import express from "express";
+// trackblock-backend / index.js
+
+const express = require("express");
+const cors = require("cors");
 
 const app = express();
-app.use(express.json());
+const PORT = process.env.PORT || 8888;
 
-// Health check
+// Middleware
+app.use(cors());
+app.use(express.json()); // Parse JSON body
+
+// Root route (for browser check)
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "trackblock-backend" });
 });
 
-// Device event endpoint (proxy will forward here)
-app.post("/device/event", (req, res) => {
-  const event = req.body;
-  console.log("[EVENT]", JSON.stringify(event, null, 2));
+// Health check
+app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
-// Railway injects PORT automatically
-const PORT = process.env.PORT || 8080;
+// Device event ingest (POST)
+app.post("/device/event", (req, res) => {
+  console.log("📡 Incoming device event:", req.body);
+
+  // Always respond 200 so device knows it succeeded
+  res.json({ ok: true, received: true });
+});
+
+// Start server
 app.listen(PORT, () => {
-  console.log(`✅ Backend running on port ${PORT}`);
+  console.log(`✅ Trackblock backend live on port ${PORT}`);
 });
