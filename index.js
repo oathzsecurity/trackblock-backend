@@ -1,34 +1,51 @@
-// trackblock-backend / index.js
-
-const express = require("express");
-const cors = require("cors");
+import express from "express";
+import cors from "cors";
+import pg from "pg";
 
 const app = express();
-const PORT = process.env.PORT || 8888;
-
-// Middleware
 app.use(cors());
-app.use(express.json()); // Parse JSON body
+app.use(express.json());
 
-// Root route (for browser check)
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+async function testDB() {
+  try {
+    const result = await pool.query("SELECT NOW()");
+    console.log("✅ Connected to Postgres at:", result.rows[0].now);
+  } catch (err) {
+    console.error("❌ DB connection failed:", err.message);
+  }
+}
+
+testDB();
+
+// DEVICE EVENT ENDPOINT
+app.post("/device/event", async (req, res) => {
+  console.log("📩 Incoming event:", req.body);
+
+  const { device, event, lat, lon } = req.body;
+
+  try {
+    await pool.query(
+      `INSERT INTO device_events (device, event, lat, lon)
+       VALUES ($1, $2, $3, $4)`,
+      [device, event, lat, lon]
+    );
+
+    res.json({ ok: true, stored: true });
+  } catch (err) {
+    console.error("❌ DB insert failed:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ROOT TEST
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "trackblock-backend" });
+  res.send("Trackblock backend is alive");
 });
 
-// Health check
-app.get("/health", (req, res) => {
-  res.json({ ok: true });
-});
-
-// Device event ingest (POST)
-app.post("/device/event", (req, res) => {
-  console.log("📡 Incoming device event:", req.body);
-
-  // Always respond 200 so device knows it succeeded
-  res.json({ ok: true, received: true });
-});
-
-// Start server
-app.listen(PORT, () => {
-  console.log(`✅ Trackblock backend live on port ${PORT}`);
-});
+const port = process.env.PORT || 8080;
+app.listen(port, () => console.log(`✅ API live on port ${port}`));
