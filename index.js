@@ -1,51 +1,61 @@
 import express from "express";
-import cors from "cors";
-import pg from "pg";
+import bodyParser from "body-parser";
+import { Pool } from "pg";
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.use(bodyParser.json());
 
-const pool = new pg.Pool({
+// --- Postgres connection ---
+const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-async function testDB() {
+// Test DB connection on startup
+(async () => {
   try {
-    const result = await pool.query("SELECT NOW()");
-    console.log("✅ Connected to Postgres at:", result.rows[0].now);
+    await pool.query("SELECT NOW()");
+    console.log("✅ Connected to Postgres");
   } catch (err) {
-    console.error("❌ DB connection failed:", err.message);
+    console.error("❌ DB connection failed:", err);
   }
-}
+})();
 
-testDB();
+// --- Routes ---
 
-// DEVICE EVENT ENDPOINT
-app.post("/device/event", async (req, res) => {
-  console.log("📩 Incoming event:", req.body);
+// Health check
+app.get("/", (req, res) => {
+  res.json({ status: "online", time: new Date().toISOString() });
+});
 
-  const { device, event, lat, lon } = req.body;
-
+// Device telemetry endpoint
+app.post("/event", async (req, res) => {
   try {
+    const { device_id, event_type, latitude, longitude } = req.body;
+
+    // Basic validation
+    if (!device_id || !event_type) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    // Insert into DB
     await pool.query(
-      `INSERT INTO device_events (device, event, lat, lon)
+      `INSERT INTO device_logs (device_id, event_type, latitude, longitude)
        VALUES ($1, $2, $3, $4)`,
-      [device, event, lat, lon]
+      [device_id, event_type, latitude, longitude]
     );
 
-    res.json({ ok: true, stored: true });
+    console.log(`✅ EVENT LOGGED:`, req.body);
+    res.json({ ok: true });
+
   } catch (err) {
-    console.error("❌ DB insert failed:", err.message);
-    res.status(500).json({ ok: false, error: err.message });
+    console.error("❌ INSERT FAILED:", err);
+    res.status(500).json({ error: "DB insert failed" });
   }
 });
 
-// ROOT TEST
-app.get("/", (req, res) => {
-  res.send("Trackblock backend is alive");
+// Start server
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`🚀 Trackblock backend running on port ${PORT}`);
 });
-
-const port = process.env.PORT || 8080;
-app.listen(port, () => console.log(`✅ API live on port ${port}`));
