@@ -61,7 +61,7 @@ let alertState = {};
   alertState = {
     "TB-DEMO-001": {
       smsSent: false,
-      callLock: false,     // true once a call has been completed
+      callLock: false,
       callAttempts: 0
     }
   }
@@ -116,7 +116,6 @@ app.post("/event", async (req, res) => {
 
     /* =====================================================
        🔁 RESET ON RE-ARM
-       When state goes back to "demo_armed", wipe flags
     ====================================================== */
     if (state === "demo_armed") {
       console.log(`🔁 Device ${device_id} re-armed → reset alert flags`);
@@ -126,8 +125,6 @@ app.post("/event", async (req, res) => {
 
     /* =====================================================
        🚨 MOVEMENT CONFIRMED → ALERT ENGINE
-       - Guaranteed ONE SMS when movement_confirmed = true
-       - Repeated calls until one is completed
     ====================================================== */
 
     const moved = movement_confirmed === true;
@@ -135,7 +132,7 @@ app.post("/event", async (req, res) => {
     if (moved && twilioClient) {
       console.log(`🚨 Movement confirmed TRUE for ${device_id}`);
 
-      // ---------- 1️⃣ GUARANTEED SINGLE SMS ----------
+      // ---------- 1️⃣ ONE SMS ----------
       if (!bucket.smsSent) {
         console.log("📨 Sending FIRST movement SMS");
         try {
@@ -151,20 +148,18 @@ Lon:${longitude}`,
         } catch (err) {
           console.error("❌ Twilio SMS error:", err);
         }
-      } else {
-        console.log("⚠️ SMS already sent for this arming session — skipping");
       }
 
       // ---------- 2️⃣ CALL ENGINE ----------
       if (!TWIML_VOICE_URL) {
         console.log("⚠️ TWIML_VOICE_URL not set — skipping calls");
       } else if (bucket.callLock) {
-        console.log("🔒 Call engine locked (call already completed) — no further calls");
+        console.log("🔒 CALL LOCKED — no further calls");
       } else if (bucket.callAttempts >= MAX_CALL_ATTEMPTS) {
-        console.log("⚠️ Max call attempts reached — no further calls");
+        console.log("⛔ Max call attempts reached");
       } else {
         bucket.callAttempts += 1;
-        console.log(`📞 CALL ATTEMPT #${bucket.callAttempts} for ${device_id}`);
+        console.log(`📞 CALL ATTEMPT #${bucket.callAttempts}`);
 
         try {
           await twilioClient.calls.create({
@@ -172,7 +167,7 @@ Lon:${longitude}`,
             to: ALERT_PHONE,
             from: TWILIO_FROM,
             statusCallback: "https://api.oathzsecurity.com/twilio/voice-status",
-            statusCallbackEvent: ["completed"],
+            statusCallbackEvent: ["answered", "completed"],
             statusCallbackMethod: "POST",
           });
         } catch (err) {
@@ -189,25 +184,27 @@ Lon:${longitude}`,
 });
 
 /* ============================================================
-   ☎️  TWILIO CALL STATUS WEBHOOK
-   Twilio POSTs here when a call is completed.
+   ☎️  📌 **UPDATED CALL STATUS LOGIC**
 ============================================================ */
 app.post("/twilio/voice-status", (req, res) => {
   try {
-    const callStatus = req.body.CallStatus;
-    const callSid    = req.body.CallSid;
+    const status  = req.body.CallStatus;      // completed, in-progress, ringing, etc
+    const dur     = Number(req.body.CallDuration || "0"); // seconds
+    const sid     = req.body.CallSid;
 
-    console.log("📞 Twilio voice-status callback:", {
-      CallStatus: callStatus,
-      CallSid: callSid,
-    });
+    console.log("📞 Twilio callback:", { status, dur, sid });
 
-    // When a call reaches "completed", treat it as answered/handled.
-    if (callStatus === "completed") {
-      console.log("🛑 Call completed → locking call engine for all devices");
+    const realAnswer =
+      status === "in-progress" ||
+      (status === "completed" && dur > 0);
+
+    if (realAnswer) {
+      console.log("☎️ **REAL CALL ANSWER DETECTED** — locking engine");
       Object.keys(alertState).forEach((id) => {
         alertState[id].callLock = true;
       });
+    } else {
+      console.log("⏳ Call not answered — will retry");
     }
 
     res.type("text/plain").send("ok");
