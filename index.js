@@ -54,18 +54,9 @@ app.get("/", (req, res) => {
 });
 
 /* ============================================================
-   🔔 ALERT STATE TRACKING (in-memory)
+   🔔 ALERT STATE TRACKING
 ============================================================ */
 let alertState = {};
-/*
-  alertState = {
-    "TB-DEMO-001": {
-      smsSent: false,
-      callLock: false,
-      callAttempts: 0
-    }
-  }
-*/
 
 function getAlertBucket(deviceId) {
   if (!alertState[deviceId]) {
@@ -97,7 +88,6 @@ app.post("/event", async (req, res) => {
 
     const bucket = getAlertBucket(device_id);
 
-    // ---- DB WRITE ----
     await pool.query(
       `INSERT INTO device_logs
        (device_id, event_type, latitude, longitude, state, movement_confirmed, gps_fix)
@@ -114,25 +104,17 @@ app.post("/event", async (req, res) => {
     );
     console.log("💾 DB WRITE OK");
 
-    /* =====================================================
-       🔁 RESET ON RE-ARM
-    ====================================================== */
+    /* 🟢 RESET FLAGS AFTER RE-ARM */
     if (state === "demo_armed") {
       console.log(`🔁 Device ${device_id} re-armed → reset alert flags`);
       alertState[device_id] = { smsSent: false, callLock: false, callAttempts: 0 };
-      return res.json({ ok: true, reset: true });
+      return res.json({ ok: true });
     }
 
-    /* =====================================================
-       🚨 MOVEMENT CONFIRMED → ALERT ENGINE
-    ====================================================== */
-
-    const moved = movement_confirmed === true;
-
-    if (moved && twilioClient) {
+    /* 🚨 MOVEMENT CONFIRMED */
+    if (movement_confirmed === true && twilioClient) {
       console.log(`🚨 Movement confirmed TRUE for ${device_id}`);
 
-      // ---------- 1️⃣ ONE SMS ----------
       if (!bucket.smsSent) {
         console.log("📨 Sending FIRST movement SMS");
         try {
@@ -142,7 +124,7 @@ ${device_id} moved!
 Lat:${latitude}
 Lon:${longitude}`,
             from: TWILIO_FROM,
-            to:   ALERT_PHONE,
+            to: ALERT_PHONE,
           });
           bucket.smsSent = true;
         } catch (err) {
@@ -150,15 +132,14 @@ Lon:${longitude}`,
         }
       }
 
-      // ---------- 2️⃣ CALL ENGINE ----------
       if (!TWIML_VOICE_URL) {
         console.log("⚠️ TWIML_VOICE_URL not set — skipping calls");
       } else if (bucket.callLock) {
-        console.log("🔒 CALL LOCKED — no further calls");
+        console.log("🔒 Call engine locked — no further calls");
       } else if (bucket.callAttempts >= MAX_CALL_ATTEMPTS) {
-        console.log("⛔ Max call attempts reached");
+        console.log("⚠️ Max call attempts reached");
       } else {
-        bucket.callAttempts += 1;
+        bucket.callAttempts++;
         console.log(`📞 CALL ATTEMPT #${bucket.callAttempts}`);
 
         try {
@@ -167,8 +148,8 @@ Lon:${longitude}`,
             to: ALERT_PHONE,
             from: TWILIO_FROM,
             statusCallback: "https://api.oathzsecurity.com/twilio/voice-status",
-            statusCallbackEvent: ["answered", "completed"],
             statusCallbackMethod: "POST",
+            statusCallbackEvent: ["completed", "answered", "no-answer"]
           });
         } catch (err) {
           console.error("❌ Twilio CALL error:", err);
@@ -176,7 +157,8 @@ Lon:${longitude}`,
       }
     }
 
-    return res.json({ ok: true });
+    res.json({ ok: true });
+
   } catch (err) {
     console.error("❌ EVENT ERROR:", err);
     res.status(500).json({ error: "server error" });
@@ -184,33 +166,34 @@ Lon:${longitude}`,
 });
 
 /* ============================================================
-   ☎️  📌 **UPDATED CALL STATUS LOGIC**
+   ☎️  TWILIO CALL STATUS HANDLER
 ============================================================ */
 app.post("/twilio/voice-status", (req, res) => {
   try {
-    const status  = req.body.CallStatus;      // completed, in-progress, ringing, etc
-    const dur     = Number(req.body.CallDuration || "0"); // seconds
-    const sid     = req.body.CallSid;
+    const status     = req.body.CallStatus;
+    const duration   = parseInt(req.body.CallDuration || "0", 10);
+    const answeredBy = req.body.AnsweredBy;
 
-    console.log("📞 Twilio callback:", { status, dur, sid });
+    console.log("📞 Twilio CALLBACK:", { status, duration, answeredBy });
 
-    const realAnswer =
-      status === "in-progress" ||
-      (status === "completed" && dur > 0);
+    if (
+      status === "completed" &&
+      duration >= 5 &&
+      answeredBy === "human"
+    ) {
+      console.log("🛑 REAL HUMAN ANSWER DETECTED — locking call engine");
 
-    if (realAnswer) {
-      console.log("☎️ **REAL CALL ANSWER DETECTED** — locking engine");
-      Object.keys(alertState).forEach((id) => {
+      Object.keys(alertState).forEach(id => {
         alertState[id].callLock = true;
       });
     } else {
-      console.log("⏳ Call not answered — will retry");
+      console.log("⚠️ Not a real answer — continuing call loop");
     }
 
-    res.type("text/plain").send("ok");
+    res.send("ok");
   } catch (err) {
-    console.error("❌ Voice callback error:", err);
-    res.type("text/plain").send("error");
+    console.error("❌ CALLBACK ERROR:", err);
+    res.send("error");
   }
 });
 
@@ -218,6 +201,6 @@ app.post("/twilio/voice-status", (req, res) => {
    🚀 SERVER
 ============================================================ */
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`🚀 Trackblock backend running on ${PORT}`);
-});
+app.listen(PORT, () =>
+  console.log(`🚀 Trackblock backend running on ${PORT}`)
+);
