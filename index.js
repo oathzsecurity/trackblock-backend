@@ -26,11 +26,11 @@ const pool = new Pool({
 /* ============================================================
    ☎️  TWILIO CONFIG
 ============================================================ */
-const TWILIO_SID       = process.env.TWILIO_SID;
-const TWILIO_TOKEN     = process.env.TWILIO_TOKEN;
-const TWILIO_FROM      = process.env.TWILIO_FROM;      // Your Twilio number
-const ALERT_PHONE      = process.env.ALERT_PHONE;      // Your mobile
-const TWIML_VOICE_URL  = process.env.TWIML_VOICE_URL;  // Your TwiML Bin URL
+const TWILIO_SID      = process.env.TWILIO_SID;
+const TWILIO_TOKEN    = process.env.TWILIO_TOKEN;
+const TWILIO_FROM     = process.env.TWILIO_FROM;      // Twilio number (+1...)
+const ALERT_PHONE     = process.env.ALERT_PHONE;      // Your mobile
+const TWIML_VOICE_URL = process.env.TWIML_VOICE_URL;  // TwiML Bin URL
 
 let twilioClient = null;
 
@@ -51,7 +51,7 @@ app.get("/", (req, res) => {
 /* ============================================================
    🔔 ALERT STATE TRACKING
 ============================================================ */
-let alertState = {};   
+let alertState = {};
 /*
   alertState = {
      "TB-DEMO-001": {
@@ -77,7 +77,8 @@ app.post("/event", async (req, res) => {
       gps_fix
     } = req.body;
 
-    if (!device_id) return res.status(400).json({ error: "Missing device_id" });
+    if (!device_id)
+      return res.status(400).json({ error: "Missing device_id" });
 
     console.log("📥 Incoming event:", req.body);
 
@@ -114,8 +115,13 @@ app.post("/event", async (req, res) => {
 
     /* =====================================================
        🚨 MOVEMENT CONFIRMED → ALERT ENGINE
+       ( Only for *real* movement events - NOT heartbeat! )
     ====================================================== */
-    if (movement_confirmed === true && twilioClient) {
+    if (
+      event_type === "demo_movement_confirmed" &&
+      movement_confirmed === true &&
+      twilioClient
+    ) {
       console.log("🚨 Movement confirmed TRUE");
 
       /* ---------- 1️⃣ SEND SMS ONCE ONLY ---------- */
@@ -134,7 +140,7 @@ Lon:${longitude}`,
         alertState[device_id].smsSent = true;
       }
 
-      /* ---------- 2️⃣ INITIATE CALL LOOP ---------- */
+      /* ---------- 2️⃣ CALL LOOP ---------- */
       if (!alertState[device_id].callLock) {
         alertState[device_id].callAttempts++;
         console.log(`📞 CALL ATTEMPT #${alertState[device_id].callAttempts}`);
@@ -144,8 +150,8 @@ Lon:${longitude}`,
           to: ALERT_PHONE,
           from: TWILIO_FROM,
           statusCallback: "https://api.oathzsecurity.com/twilio/voice-status",
-          statusCallbackEvent: ["completed"],
-          statusCallbackMethod: "POST"
+          statusCallbackMethod: "POST",
+          statusCallbackEvent: ["completed"]
         });
       }
 
@@ -161,7 +167,8 @@ Lon:${longitude}`,
 });
 
 /* ============================================================
-   ☎️  TWILIO CALL STATUS WEBHOOK
+   ☎️ TWILIO CALL STATUS CALLBACK
+   ❗ Automatically stops repeat calls once answered
 ============================================================ */
 app.post("/twilio/voice-status", async (req, res) => {
   try {
@@ -169,13 +176,14 @@ app.post("/twilio/voice-status", async (req, res) => {
     console.log("📞 Twilio callback:", callStatus);
 
     if (callStatus === "completed") {
-      console.log("🛑 CALL ANSWERED → LOCKING ALERT ENGINE");
+      console.log("🛑 CALL ANSWERED → LOCKING ENGINE");
       for (const d in alertState) {
         alertState[d].callLock = true;
       }
     }
 
     res.json({ received: true });
+
   } catch (err) {
     console.error("❌ Voice callback error:", err);
     res.json({ received: true });
@@ -186,4 +194,6 @@ app.post("/twilio/voice-status", async (req, res) => {
    🚀 SERVER
 ============================================================ */
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 Trackblock backend running on ${PORT}`));
+app.listen(PORT, () =>
+  console.log(`🚀 Trackblock backend running on ${PORT}`)
+);
