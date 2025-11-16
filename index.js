@@ -4,14 +4,17 @@ import { Pool } from "pg";
 import twilio from "twilio";
 
 const app = express();
+
+// Parse JSON (device → backend) AND urlencoded (Twilio → backend)
 app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: false }));
 
 /* ============================================================
    🗄 POSTGRES
 ============================================================ */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
 });
 
 (async () => {
@@ -28,9 +31,11 @@ const pool = new Pool({
 ============================================================ */
 const TWILIO_SID      = process.env.TWILIO_SID;
 const TWILIO_TOKEN    = process.env.TWILIO_TOKEN;
-const TWILIO_FROM     = process.env.TWILIO_FROM;      // Twilio number (+1...)
+const TWILIO_FROM     = process.env.TWILIO_FROM;      // Your Twilio number
 const ALERT_PHONE     = process.env.ALERT_PHONE;      // Your mobile
-const TWIML_VOICE_URL = process.env.TWIML_VOICE_URL;  // TwiML Bin URL
+const TWIML_VOICE_URL = process.env.TWIML_VOICE_URL;  // Your TwiML Bin URL
+
+const MAX_CALL_ATTEMPTS = 10;
 
 let twilioClient = null;
 
@@ -49,18 +54,25 @@ app.get("/", (req, res) => {
 });
 
 /* ============================================================
-   🔔 ALERT STATE TRACKING
+   🔔 ALERT STATE TRACKING (in-memory)
 ============================================================ */
 let alertState = {};
 /*
   alertState = {
-     "TB-DEMO-001": {
-         smsSent: false,
-         callLock: false,   // becomes TRUE after call answered
-         callAttempts: 0
-     }
+    "TB-DEMO-001": {
+      smsSent: false,
+      callLock: false,     // true once a call has been completed
+      callAttempts: 0
+    }
   }
 */
+
+function getAlertBucket(deviceId) {
+  if (!alertState[deviceId]) {
+    alertState[deviceId] = { smsSent: false, callLock: false, callAttempts: 0 };
+  }
+  return alertState[deviceId];
+}
 
 /* ============================================================
    🛰 EVENT INGESTION
@@ -74,14 +86,18 @@ app.post("/event", async (req, res) => {
       longitude,
       movement_confirmed,
       state,
-      gps_fix
+      gps_fix,
     } = req.body;
 
-    if (!device_id)
+    if (!device_id) {
       return res.status(400).json({ error: "Missing device_id" });
+    }
 
     console.log("📥 Incoming event:", req.body);
 
+    const bucket = getAlertBucket(device_id);
+
+    // ---- DB WRITE ----
     await pool.query(
       `INSERT INTO device_logs
        (device_id, event_type, latitude, longitude, state, movement_confirmed, gps_fix)
@@ -93,73 +109,79 @@ app.post("/event", async (req, res) => {
         longitude || null,
         state || null,
         movement_confirmed ?? null,
-        gps_fix ?? null
+        gps_fix ?? null,
       ]
     );
-
     console.log("💾 DB WRITE OK");
 
     /* =====================================================
-       🔁 RESET ALERT FLAGS WHEN DEVICE RETURNS TO ARMED
+       🔁 RESET ON RE-ARM
+       When state goes back to "demo_armed", wipe flags
     ====================================================== */
     if (state === "demo_armed") {
-      console.log("🔁 Device re-armed → reset alert flags");
+      console.log(`🔁 Device ${device_id} re-armed → reset alert flags`);
       alertState[device_id] = { smsSent: false, callLock: false, callAttempts: 0 };
-      return res.json({ ok: true });
-    }
-
-    /* Ensure bucket exists */
-    if (!alertState[device_id]) {
-      alertState[device_id] = { smsSent: false, callLock: false, callAttempts: 0 };
+      return res.json({ ok: true, reset: true });
     }
 
     /* =====================================================
        🚨 MOVEMENT CONFIRMED → ALERT ENGINE
-       ( Only for *real* movement events - NOT heartbeat! )
+       - Guaranteed ONE SMS when movement_confirmed = true
+       - Repeated calls until one is completed
     ====================================================== */
-    if (
-      event_type === "demo_movement_confirmed" &&
-      movement_confirmed === true &&
-      twilioClient
-    ) {
-      console.log("🚨 Movement confirmed TRUE");
 
-      /* ---------- 1️⃣ SEND SMS ONCE ONLY ---------- */
-      if (!alertState[device_id].smsSent) {
+    const moved = movement_confirmed === true;
+
+    if (moved && twilioClient) {
+      console.log(`🚨 Movement confirmed TRUE for ${device_id}`);
+
+      // ---------- 1️⃣ GUARANTEED SINGLE SMS ----------
+      if (!bucket.smsSent) {
         console.log("📨 Sending FIRST movement SMS");
-
-        await twilioClient.messages.create({
-          body: `🚨 Trackblock ALERT 🚨
+        try {
+          await twilioClient.messages.create({
+            body: `🚨 Trackblock ALERT 🚨
 ${device_id} moved!
 Lat:${latitude}
 Lon:${longitude}`,
-          from: TWILIO_FROM,
-          to: ALERT_PHONE
-        });
-
-        alertState[device_id].smsSent = true;
+            from: TWILIO_FROM,
+            to:   ALERT_PHONE,
+          });
+          bucket.smsSent = true;
+        } catch (err) {
+          console.error("❌ Twilio SMS error:", err);
+        }
+      } else {
+        console.log("⚠️ SMS already sent for this arming session — skipping");
       }
 
-      /* ---------- 2️⃣ CALL LOOP ---------- */
-      if (!alertState[device_id].callLock) {
-        alertState[device_id].callAttempts++;
-        console.log(`📞 CALL ATTEMPT #${alertState[device_id].callAttempts}`);
+      // ---------- 2️⃣ CALL ENGINE ----------
+      if (!TWIML_VOICE_URL) {
+        console.log("⚠️ TWIML_VOICE_URL not set — skipping calls");
+      } else if (bucket.callLock) {
+        console.log("🔒 Call engine locked (call already completed) — no further calls");
+      } else if (bucket.callAttempts >= MAX_CALL_ATTEMPTS) {
+        console.log("⚠️ Max call attempts reached — no further calls");
+      } else {
+        bucket.callAttempts += 1;
+        console.log(`📞 CALL ATTEMPT #${bucket.callAttempts} for ${device_id}`);
 
-        await twilioClient.calls.create({
-          url: TWIML_VOICE_URL,
-          to: ALERT_PHONE,
-          from: TWILIO_FROM,
-          statusCallback: "https://api.oathzsecurity.com/twilio/voice-status",
-          statusCallbackMethod: "POST",
-          statusCallbackEvent: ["completed"]
-        });
+        try {
+          await twilioClient.calls.create({
+            url: TWIML_VOICE_URL,
+            to: ALERT_PHONE,
+            from: TWILIO_FROM,
+            statusCallback: "https://api.oathzsecurity.com/twilio/voice-status",
+            statusCallbackEvent: ["completed"],
+            statusCallbackMethod: "POST",
+          });
+        } catch (err) {
+          console.error("❌ Twilio CALL error:", err);
+        }
       }
-
-      return res.json({ ok: true });
     }
 
     return res.json({ ok: true });
-
   } catch (err) {
     console.error("❌ EVENT ERROR:", err);
     res.status(500).json({ error: "server error" });
@@ -167,26 +189,31 @@ Lon:${longitude}`,
 });
 
 /* ============================================================
-   ☎️ TWILIO CALL STATUS CALLBACK
-   ❗ Automatically stops repeat calls once answered
+   ☎️  TWILIO CALL STATUS WEBHOOK
+   Twilio POSTs here when a call is completed.
 ============================================================ */
-app.post("/twilio/voice-status", async (req, res) => {
+app.post("/twilio/voice-status", (req, res) => {
   try {
     const callStatus = req.body.CallStatus;
-    console.log("📞 Twilio callback:", callStatus);
+    const callSid    = req.body.CallSid;
 
+    console.log("📞 Twilio voice-status callback:", {
+      CallStatus: callStatus,
+      CallSid: callSid,
+    });
+
+    // When a call reaches "completed", treat it as answered/handled.
     if (callStatus === "completed") {
-      console.log("🛑 CALL ANSWERED → LOCKING ENGINE");
-      for (const d in alertState) {
-        alertState[d].callLock = true;
-      }
+      console.log("🛑 Call completed → locking call engine for all devices");
+      Object.keys(alertState).forEach((id) => {
+        alertState[id].callLock = true;
+      });
     }
 
-    res.json({ received: true });
-
+    res.type("text/plain").send("ok");
   } catch (err) {
     console.error("❌ Voice callback error:", err);
-    res.json({ received: true });
+    res.type("text/plain").send("error");
   }
 });
 
@@ -194,6 +221,6 @@ app.post("/twilio/voice-status", async (req, res) => {
    🚀 SERVER
 ============================================================ */
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () =>
-  console.log(`🚀 Trackblock backend running on ${PORT}`)
-);
+app.listen(PORT, () => {
+  console.log(`🚀 Trackblock backend running on ${PORT}`);
+});
