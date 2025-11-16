@@ -5,7 +5,7 @@ import twilio from "twilio";
 
 const app = express();
 
-// Parse JSON (device → backend) AND urlencoded (Twilio → backend)
+// Parse JSON (device → backend) AND x-www-form-urlencoded (Twilio → backend)
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: false }));
 
@@ -27,18 +27,17 @@ const pool = new Pool({
 })();
 
 /* ============================================================
-   ☎️  TWILIO CONFIG
+   ☎️ TWILIO CONFIG
 ============================================================ */
 const TWILIO_SID      = process.env.TWILIO_SID;
 const TWILIO_TOKEN    = process.env.TWILIO_TOKEN;
-const TWILIO_FROM     = process.env.TWILIO_FROM;      // Your Twilio number
-const ALERT_PHONE     = process.env.ALERT_PHONE;      // Your mobile
-const TWIML_VOICE_URL = process.env.TWIML_VOICE_URL;  // Your TwiML Bin URL
+const TWILIO_FROM     = process.env.TWILIO_FROM;
+const ALERT_PHONE     = process.env.ALERT_PHONE;
+const TWIML_VOICE_URL = process.env.TWIML_VOICE_URL;
 
 const MAX_CALL_ATTEMPTS = 10;
 
 let twilioClient = null;
-
 if (TWILIO_SID && TWILIO_TOKEN) {
   twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
   console.log("📡 Twilio client initialised");
@@ -47,23 +46,22 @@ if (TWILIO_SID && TWILIO_TOKEN) {
 }
 
 /* ============================================================
+   🔔 STATE TRACKING
+============================================================ */
+let alertState = {};
+
+function bucket(id) {
+  if (!alertState[id])
+    alertState[id] = { smsSent: false, callLock: false, callAttempts: 0 };
+  return alertState[id];
+}
+
+/* ============================================================
    🩺 HEALTH CHECK
 ============================================================ */
 app.get("/", (req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
-
-/* ============================================================
-   🔔 ALERT STATE TRACKING
-============================================================ */
-let alertState = {};
-
-function getAlertBucket(deviceId) {
-  if (!alertState[deviceId]) {
-    alertState[deviceId] = { smsSent: false, callLock: false, callAttempts: 0 };
-  }
-  return alertState[deviceId];
-}
 
 /* ============================================================
    🛰 EVENT INGESTION
@@ -80,18 +78,16 @@ app.post("/event", async (req, res) => {
       gps_fix,
     } = req.body;
 
-    if (!device_id) {
-      return res.status(400).json({ error: "Missing device_id" });
-    }
+    if (!device_id) return res.status(400).json({ error: "Missing device_id" });
+
+    const b = bucket(device_id);
 
     console.log("📥 Incoming event:", req.body);
 
-    const bucket = getAlertBucket(device_id);
-
     await pool.query(
       `INSERT INTO device_logs
-       (device_id, event_type, latitude, longitude, state, movement_confirmed, gps_fix)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      (device_id, event_type, latitude, longitude, state, movement_confirmed, gps_fix)
+      VALUES ($1,$2,$3,$4,$5,$6,$7)`,
       [
         device_id,
         event_type,
@@ -102,21 +98,27 @@ app.post("/event", async (req, res) => {
         gps_fix ?? null,
       ]
     );
+
     console.log("💾 DB WRITE OK");
 
-    /* 🟢 RESET FLAGS AFTER RE-ARM */
+    /* =====================================================
+       🔁 RESET WHEN DEVICE ARMS
+    ====================================================== */
     if (state === "demo_armed") {
-      console.log(`🔁 Device ${device_id} re-armed → reset alert flags`);
+      console.log(`🔁 RESET alert flags for ${device_id}`);
       alertState[device_id] = { smsSent: false, callLock: false, callAttempts: 0 };
       return res.json({ ok: true });
     }
 
-    /* 🚨 MOVEMENT CONFIRMED */
+    /* =====================================================
+       🚨 MOVEMENT CONFIRMED
+    ====================================================== */
     if (movement_confirmed === true && twilioClient) {
-      console.log(`🚨 Movement confirmed TRUE for ${device_id}`);
+      console.log(`🚨 MOVEMENT TRUE for ${device_id}`);
 
-      if (!bucket.smsSent) {
-        console.log("📨 Sending FIRST movement SMS");
+      // 1️⃣ SEND SMS ONCE
+      if (!b.smsSent) {
+        console.log("📨 Sending FIRST SMS alert...");
         try {
           await twilioClient.messages.create({
             body: `🚨 Trackblock ALERT 🚨
@@ -126,21 +128,22 @@ Lon:${longitude}`,
             from: TWILIO_FROM,
             to: ALERT_PHONE,
           });
-          bucket.smsSent = true;
+          b.smsSent = true;
         } catch (err) {
-          console.error("❌ Twilio SMS error:", err);
+          console.error("❌ SMS ERROR:", err);
         }
       }
 
+      // 2️⃣ CALL ENGINE
       if (!TWIML_VOICE_URL) {
-        console.log("⚠️ TWIML_VOICE_URL not set — skipping calls");
-      } else if (bucket.callLock) {
-        console.log("🔒 Call engine locked — no further calls");
-      } else if (bucket.callAttempts >= MAX_CALL_ATTEMPTS) {
-        console.log("⚠️ Max call attempts reached");
+        console.log("⚠️ TWIML URL missing — skip calls");
+      } else if (b.callLock) {
+        console.log("🔒 CALL ENGINE LOCKED — NO MORE CALLS");
+      } else if (b.callAttempts >= MAX_CALL_ATTEMPTS) {
+        console.log("⛔ MAX CALL ATTEMPTS REACHED");
       } else {
-        bucket.callAttempts++;
-        console.log(`📞 CALL ATTEMPT #${bucket.callAttempts}`);
+        b.callAttempts++;
+        console.log(`☎ CALL ATTEMPT #${b.callAttempts}`);
 
         try {
           await twilioClient.calls.create({
@@ -149,16 +152,15 @@ Lon:${longitude}`,
             from: TWILIO_FROM,
             statusCallback: "https://api.oathzsecurity.com/twilio/voice-status",
             statusCallbackMethod: "POST",
-            statusCallbackEvent: ["completed", "answered", "no-answer"]
+            statusCallbackEvent: ["completed"],
           });
         } catch (err) {
-          console.error("❌ Twilio CALL error:", err);
+          console.error("❌ CALL ERROR:", err);
         }
       }
     }
 
-    res.json({ ok: true });
-
+    return res.json({ ok: true });
   } catch (err) {
     console.error("❌ EVENT ERROR:", err);
     res.status(500).json({ error: "server error" });
@@ -166,34 +168,37 @@ Lon:${longitude}`,
 });
 
 /* ============================================================
-   ☎️  TWILIO CALL STATUS HANDLER
+   ☎️ TWILIO CALLBACK
 ============================================================ */
 app.post("/twilio/voice-status", (req, res) => {
   try {
     const status     = req.body.CallStatus;
+    const sid        = req.body.CallSid;
     const duration   = parseInt(req.body.CallDuration || "0", 10);
-    const answeredBy = req.body.AnsweredBy;
 
-    console.log("📞 Twilio CALLBACK:", { status, duration, answeredBy });
+    console.log("📞 CALL CALLBACK:", { status, duration, sid });
 
-    if (
-      status === "completed" &&
-      duration >= 5 &&
-      answeredBy === "human"
-    ) {
-      console.log("🛑 REAL HUMAN ANSWER DETECTED — locking call engine");
+    //
+    // ⭐⭐ THE FIX ⭐⭐
+    //
+    // Lock ONLY when:
+    //   STATUS === completed
+    //   DURATION ≥ 2 seconds
+    //
+    if (status === "completed" && duration >= 2) {
+      console.log(`🛑 REAL HUMAN ANSWER DETECTED — CALL ENGINE LOCKED`);
 
-      Object.keys(alertState).forEach(id => {
+      Object.keys(alertState).forEach((id) => {
         alertState[id].callLock = true;
       });
     } else {
-      console.log("⚠️ Not a real answer — continuing call loop");
+      console.log(`⚠️ Ignoring callback — not a real answer`);
     }
 
-    res.send("ok");
+    res.type("text/plain").send("ok");
   } catch (err) {
     console.error("❌ CALLBACK ERROR:", err);
-    res.send("error");
+    res.type("text/plain").send("error");
   }
 });
 
@@ -201,6 +206,6 @@ app.post("/twilio/voice-status", (req, res) => {
    🚀 SERVER
 ============================================================ */
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () =>
-  console.log(`🚀 Trackblock backend running on ${PORT}`)
-);
+app.listen(PORT, () => {
+  console.log(`🚀 Trackblock backend running on ${PORT}`);
+});
