@@ -35,8 +35,6 @@ const TWILIO_FROM     = process.env.TWILIO_FROM;
 const ALERT_PHONE     = process.env.ALERT_PHONE;
 const TWIML_VOICE_URL = process.env.TWIML_VOICE_URL;
 
-const MAX_CALL_ATTEMPTS = 10;
-
 let twilioClient = null;
 if (TWILIO_SID && TWILIO_TOKEN) {
   twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
@@ -134,16 +132,17 @@ Lon:${longitude}`,
         }
       }
 
-      // 2️⃣ CALL ENGINE
+      // 2️⃣ CALL ENGINE — ALWAYS 2 CALLS
       if (!TWIML_VOICE_URL) {
         console.log("⚠️ TWIML URL missing — skip calls");
       } else if (b.callLock) {
         console.log("🔒 CALL ENGINE LOCKED — NO MORE CALLS");
-      } else if (b.callAttempts >= MAX_CALL_ATTEMPTS) {
-        console.log("⛔ MAX CALL ATTEMPTS REACHED");
+      } else if (b.callAttempts >= 2) {
+        console.log("🛑 TWO CALLS MADE — LOCKING ENGINE");
+        b.callLock = true;
       } else {
         b.callAttempts++;
-        console.log(`☎ CALL ATTEMPT #${b.callAttempts}`);
+        console.log(`☎ FORCED CALL #${b.callAttempts}`);
 
         try {
           await twilioClient.calls.create({
@@ -171,35 +170,8 @@ Lon:${longitude}`,
    ☎️ TWILIO CALLBACK
 ============================================================ */
 app.post("/twilio/voice-status", (req, res) => {
-  try {
-    const status     = req.body.CallStatus;
-    const sid        = req.body.CallSid;
-    const duration   = parseInt(req.body.CallDuration || "0", 10);
-
-    console.log("📞 CALL CALLBACK:", { status, duration, sid });
-
-    //
-    // ⭐⭐ THE FIX ⭐⭐
-    //
-    // Lock ONLY when:
-    //   STATUS === completed
-    //   DURATION ≥ 2 seconds
-    //
-    if (status === "completed" && duration >= 2) {
-      console.log(`🛑 REAL HUMAN ANSWER DETECTED — CALL ENGINE LOCKED`);
-
-      Object.keys(alertState).forEach((id) => {
-        alertState[id].callLock = true;
-      });
-    } else {
-      console.log(`⚠️ Ignoring callback — not a real answer`);
-    }
-
-    res.type("text/plain").send("ok");
-  } catch (err) {
-    console.error("❌ CALLBACK ERROR:", err);
-    res.type("text/plain").send("error");
-  }
+  console.log("📞 CALLBACK RECEIVED:", req.body.CallStatus);
+  res.type("text/plain").send("ok");
 });
 
 /* ============================================================
