@@ -1,197 +1,105 @@
 import express from "express";
-import bodyParser from "body-parser";
-import { Pool } from "pg";
-import twilio from "twilio";
+import cors from "cors";
+import axios from "axios";
 
 const app = express();
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: false }));
+app.use(express.json());
 
-/* ============================================================
-   🗄 POSTGRES
-============================================================ */
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
+// ⭐ CORS — allow your dashboard + future UI
+app.use(
+  cors({
+    origin: [
+      "http://localhost:3000",
+      "http://127.0.0.1:3000",
+      "https://oathz-dashboard.vercel.app",
+      "https://www.oathzsecurity.com",
+      "https://oathzsecurity.com",
+    ],
+    methods: ["GET", "POST"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
 
-(async () => {
-  try {
-    await pool.query("SELECT NOW()");
-    console.log("✅ Connected to Postgres");
-  } catch (err) {
-    console.error("❌ DB connection failed:", err);
-  }
-})();
+// ⭐ Your PostgreSQL / event storage (replace with real DB soon)
+let deviceEvents = [];
 
-/* ============================================================
-   ☎️ TWILIO CONFIG
-============================================================ */
-const TWILIO_SID      = process.env.TWILIO_SID;
-const TWILIO_TOKEN    = process.env.TWILIO_TOKEN;
-const TWILIO_FROM     = process.env.TWILIO_FROM;
-const ALERT_PHONE     = process.env.ALERT_PHONE;
-const TWIML_VOICE_URL = process.env.TWIML_VOICE_URL;
-
-let twilioClient = null;
-if (TWILIO_SID && TWILIO_TOKEN) {
-  twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
-  console.log("📡 Twilio client initialised");
-} else {
-  console.log("⚠️ Twilio NOT configured — alerts disabled");
-}
-
-/* ============================================================
-   🔔 STATE TRACKING
-============================================================ */
-let alertState = {};
-function bucket(id) {
-  if (!alertState[id])
-    alertState[id] = { smsSent: false, callLock: false, callAttempts: 0 };
-  return alertState[id];
-}
-
-/* ============================================================
-   🟢 HEALTH CHECK
-============================================================ */
+// ---------------------------------------------
+//  HEALTH CHECK
+// ---------------------------------------------
 app.get("/", (req, res) => {
-  res.json({ ok: true, time: new Date().toISOString() });
+  res.json({ status: "Trackblock backend is LIVE ⚡" });
 });
 
-/* ============================================================
-   🆕 NEW ENDPOINT → UI LIVE DASHBOARD
-============================================================ */
+// ---------------------------------------------
+//  GET ALL DEVICE STATUS (used by dashboard)
+//  URL: https://api.oathzsecurity.com/status
+// ---------------------------------------------
 app.get("/status", async (req, res) => {
   try {
-    const q = `
-      SELECT DISTINCT ON (device_id)
-        device_id, event_type, state, movement_confirmed, gps_fix,
-        latitude, longitude,
-        created_at as last_seen
-      FROM device_logs
-      ORDER BY device_id, created_at DESC;
-    `;
-
-    const result = await pool.query(q);
-    return res.json(result.rows);
+    res.json(deviceEvents);
   } catch (err) {
-    console.error("❌ STATUS DB ERR", err);
-    res.status(500).json({ error: "db error" });
+    console.error("STATUS ERROR:", err);
+    res.status(500).json({ error: "Failed to fetch status" });
   }
 });
 
-/* ============================================================
-   🛰 EVENT INGESTION
-============================================================ */
+// ---------------------------------------------
+//  DEVICE POSTS DATA → BACKEND
+//  URL: https://api.oathzsecurity.com/event
+// ---------------------------------------------
 app.post("/event", async (req, res) => {
   try {
-    const {
-      device_id,
-      event_type,
-      latitude,
-      longitude,
-      movement_confirmed,
-      state,
-      gps_fix,
-    } = req.body;
+    const payload = req.body;
+    payload.last_seen = new Date().toISOString();
 
-    if (!device_id) return res.status(400).json({ error: "Missing device_id" });
-
-    const b = bucket(device_id);
-
-    console.log("📥 Incoming event:", req.body);
-
-    await pool.query(
-      `INSERT INTO device_logs
-      (device_id, event_type, latitude, longitude, state, movement_confirmed, gps_fix)
-      VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [
-        device_id,
-        event_type,
-        latitude || null,
-        longitude || null,
-        state || null,
-        movement_confirmed ?? null,
-        gps_fix ?? null,
-      ]
+    // Upsert logic:
+    const existingIndex = deviceEvents.findIndex(
+      (d) => d.device_id === payload.device_id
     );
 
-    console.log("💾 DB WRITE OK");
-
-    if (state === "demo_armed") {
-      console.log(`🔁 RESET alert flags for ${device_id}`);
-      alertState[device_id] = { smsSent: false, callLock: false, callAttempts: 0 };
-      return res.json({ ok: true });
+    if (existingIndex === -1) {
+      deviceEvents.push(payload);
+    } else {
+      deviceEvents[existingIndex] = { ...deviceEvents[existingIndex], ...payload };
     }
 
-    /* =====================================================
-       🚨 MOVEMENT CONFIRMED
-    ====================================================== */
-    if (movement_confirmed === true && twilioClient) {
-      console.log(`🚨 MOVEMENT TRUE for ${device_id}`);
+    console.log("📥 EVENT RECEIVED:", payload.device_id, payload.event_type);
 
-      if (!b.smsSent) {
-        console.log("📨 Sending FIRST SMS alert...");
-        try {
-          await twilioClient.messages.create({
-            body: `🚨 Trackblock ALERT 🚨
-${device_id} moved!
-Lat:${latitude}
-Lon:${longitude}`,
-            from: TWILIO_FROM,
-            to: ALERT_PHONE,
-          });
-          b.smsSent = true;
-        } catch (err) {
-          console.error("❌ SMS ERROR:", err);
-        }
-      }
-
-      if (!TWIML_VOICE_URL) {
-        console.log("⚠️ TWIML URL missing — skip calls");
-      } else if (b.callLock) {
-        console.log("🔒 CALL ENGINE LOCKED");
-      } else if (b.callAttempts >= 2) {
-        console.log("🛑 TWO CALLS MADE — LOCKING");
-        b.callLock = true;
-      } else {
-        b.callAttempts++;
-        console.log(`☎ FORCED CALL #${b.callAttempts}`);
-
-        try {
-          await twilioClient.calls.create({
-            url: TWIML_VOICE_URL,
-            to: ALERT_PHONE,
-            from: TWILIO_FROM,
-            statusCallback: "https://api.oathzsecurity.com/twilio/voice-status",
-            statusCallbackMethod: "POST",
-            statusCallbackEvent: ["completed"],
-          });
-        } catch (err) {
-          console.error("❌ CALL ERROR:", err);
-        }
-      }
-    }
-
-    return res.json({ ok: true });
+    res.json({ ok: true });
   } catch (err) {
-    console.error("❌ EVENT ERROR:", err);
-    res.status(500).json({ error: "server error" });
+    console.error("EVENT ERROR:", err);
+    res.status(500).json({ error: "Failed to save event" });
   }
 });
 
-/* ============================================================
-   ☎️ TWILIO CALLBACK
-============================================================ */
-app.post("/twilio/voice-status", (req, res) => {
-  console.log("📞 CALLBACK RECEIVED:", req.body.CallStatus);
-  res.type("text/plain").send("ok");
+// ---------------------------------------------
+//  RESET ALERT ENGINE
+//  URL: POST https://api.oathzsecurity.com/device/:id/reset
+// ---------------------------------------------
+app.post("/device/:id/reset", async (req, res) => {
+  const id = req.params.id;
+
+  try {
+    const d = deviceEvents.find((x) => x.device_id === id);
+    if (!d) return res.status(404).json({ error: "Device not found" });
+
+    d.smsSent = false;
+    d.callAttempts = 0;
+    d.callLock = false;
+
+    console.log(`🔄 ALERTS RESET for ${id}`);
+
+    res.json({ ok: true, device_id: id });
+  } catch (err) {
+    console.error("RESET ERROR:", err);
+    res.status(500).json({ error: "Failed to reset alerts" });
+  }
 });
 
-/* ============================================================
-   🚀 SERVER
-============================================================ */
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () =>
-  console.log(`🚀 Trackblock backend running on ${PORT}`)
+// ---------------------------------------------
+//  SERVER START
+// ---------------------------------------------
+const port = process.env.PORT || 8080;
+app.listen(port, () =>
+  console.log(`🚀 Trackblock backend running on ${port}`)
 );
