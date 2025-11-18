@@ -4,8 +4,6 @@ import { Pool } from "pg";
 import twilio from "twilio";
 
 const app = express();
-
-// Parse JSON (device → backend) AND x-www-form-urlencoded (Twilio → backend)
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: false }));
 
@@ -47,7 +45,6 @@ if (TWILIO_SID && TWILIO_TOKEN) {
    🔔 STATE TRACKING
 ============================================================ */
 let alertState = {};
-
 function bucket(id) {
   if (!alertState[id])
     alertState[id] = { smsSent: false, callLock: false, callAttempts: 0 };
@@ -55,10 +52,32 @@ function bucket(id) {
 }
 
 /* ============================================================
-   🩺 HEALTH CHECK
+   🟢 HEALTH CHECK
 ============================================================ */
 app.get("/", (req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
+});
+
+/* ============================================================
+   🆕 NEW ENDPOINT → UI LIVE DASHBOARD
+============================================================ */
+app.get("/status", async (req, res) => {
+  try {
+    const q = `
+      SELECT DISTINCT ON (device_id)
+        device_id, event_type, state, movement_confirmed, gps_fix,
+        latitude, longitude,
+        created_at as last_seen
+      FROM device_logs
+      ORDER BY device_id, created_at DESC;
+    `;
+
+    const result = await pool.query(q);
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("❌ STATUS DB ERR", err);
+    res.status(500).json({ error: "db error" });
+  }
 });
 
 /* ============================================================
@@ -84,8 +103,8 @@ app.post("/event", async (req, res) => {
 
     await pool.query(
       `INSERT INTO device_logs
-       (device_id, event_type, latitude, longitude, state, movement_confirmed, gps_fix)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      (device_id, event_type, latitude, longitude, state, movement_confirmed, gps_fix)
+      VALUES ($1,$2,$3,$4,$5,$6,$7)`,
       [
         device_id,
         event_type,
@@ -99,9 +118,6 @@ app.post("/event", async (req, res) => {
 
     console.log("💾 DB WRITE OK");
 
-    /* =====================================================
-       🔁 RESET WHEN DEVICE ARMS
-    ====================================================== */
     if (state === "demo_armed") {
       console.log(`🔁 RESET alert flags for ${device_id}`);
       alertState[device_id] = { smsSent: false, callLock: false, callAttempts: 0 };
@@ -114,7 +130,6 @@ app.post("/event", async (req, res) => {
     if (movement_confirmed === true && twilioClient) {
       console.log(`🚨 MOVEMENT TRUE for ${device_id}`);
 
-      // 1️⃣ SEND SMS ONCE
       if (!b.smsSent) {
         console.log("📨 Sending FIRST SMS alert...");
         try {
@@ -132,13 +147,12 @@ Lon:${longitude}`,
         }
       }
 
-      // 2️⃣ CALL ENGINE — ALWAYS 2 CALLS
       if (!TWIML_VOICE_URL) {
         console.log("⚠️ TWIML URL missing — skip calls");
       } else if (b.callLock) {
-        console.log("🔒 CALL ENGINE LOCKED — NO MORE CALLS");
+        console.log("🔒 CALL ENGINE LOCKED");
       } else if (b.callAttempts >= 2) {
-        console.log("🛑 TWO CALLS MADE — LOCKING ENGINE");
+        console.log("🛑 TWO CALLS MADE — LOCKING");
         b.callLock = true;
       } else {
         b.callAttempts++;
@@ -175,61 +189,9 @@ app.post("/twilio/voice-status", (req, res) => {
 });
 
 /* ============================================================
-   🛰 UI LIVE STATUS ENDPOINT
-============================================================ */
-app.get("/device/:id/status", async (req, res) => {
-  const id = req.params.id;
-  const state = alertState[id];
-
-  if (!state)
-    return res.json({ error: "device not seen yet" });
-
-  const r = await pool.query(
-    `SELECT *
-     FROM device_logs
-     WHERE device_id=$1
-     ORDER BY id DESC
-     LIMIT 1`,
-    [id]
-  );
-
-  const row = r.rows[0] || {};
-
-  res.json({
-    device_id: id,
-    last_seen: row.timestamp || null,
-    state: row.state || null,
-    latitude: row.latitude || null,
-    longitude: row.longitude || null,
-    gps_fix: row.gps_fix || false,
-    movement_confirmed: row.movement_confirmed || false,
-    smsSent: state.smsSent,
-    callAttempts: state.callAttempts,
-    callLock: state.callLock
-  });
-});
-
-/* ============================================================
-   🔄 RESET ALERT ENGINE ENDPOINT
-============================================================ */
-app.post("/device/:id/reset", (req, res) => {
-  const id = req.params.id;
-
-  alertState[id] = {
-    smsSent: false,
-    callAttempts: 0,
-    callLock: false
-  };
-
-  console.log(`🔄 ALERT ENGINE RESET for ${id}`);
-
-  res.json({ ok: true });
-});
-
-/* ============================================================
    🚀 SERVER
 ============================================================ */
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`🚀 Trackblock backend running on ${PORT}`);
-});
+app.listen(PORT, () =>
+  console.log(`🚀 Trackblock backend running on ${PORT}`)
+);
