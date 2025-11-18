@@ -84,8 +84,8 @@ app.post("/event", async (req, res) => {
 
     await pool.query(
       `INSERT INTO device_logs
-      (device_id, event_type, latitude, longitude, state, movement_confirmed, gps_fix)
-      VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+       (device_id, event_type, latitude, longitude, state, movement_confirmed, gps_fix)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
       [
         device_id,
         event_type,
@@ -172,6 +172,58 @@ Lon:${longitude}`,
 app.post("/twilio/voice-status", (req, res) => {
   console.log("📞 CALLBACK RECEIVED:", req.body.CallStatus);
   res.type("text/plain").send("ok");
+});
+
+/* ============================================================
+   🛰 UI LIVE STATUS ENDPOINT
+============================================================ */
+app.get("/device/:id/status", async (req, res) => {
+  const id = req.params.id;
+  const state = alertState[id];
+
+  if (!state)
+    return res.json({ error: "device not seen yet" });
+
+  const r = await pool.query(
+    `SELECT *
+     FROM device_logs
+     WHERE device_id=$1
+     ORDER BY id DESC
+     LIMIT 1`,
+    [id]
+  );
+
+  const row = r.rows[0] || {};
+
+  res.json({
+    device_id: id,
+    last_seen: row.timestamp || null,
+    state: row.state || null,
+    latitude: row.latitude || null,
+    longitude: row.longitude || null,
+    gps_fix: row.gps_fix || false,
+    movement_confirmed: row.movement_confirmed || false,
+    smsSent: state.smsSent,
+    callAttempts: state.callAttempts,
+    callLock: state.callLock
+  });
+});
+
+/* ============================================================
+   🔄 RESET ALERT ENGINE ENDPOINT
+============================================================ */
+app.post("/device/:id/reset", (req, res) => {
+  const id = req.params.id;
+
+  alertState[id] = {
+    smsSent: false,
+    callAttempts: 0,
+    callLock: false
+  };
+
+  console.log(`🔄 ALERT ENGINE RESET for ${id}`);
+
+  res.json({ ok: true });
 });
 
 /* ============================================================
