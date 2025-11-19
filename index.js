@@ -7,9 +7,9 @@ import path from "path";
 const app = express();
 app.use(express.json());
 
-// ==============================================
-// ⭐ CORS — allow your dashboard + future UI
-// ==============================================
+// ===================================================
+// ⭐ CORS — allow your dashboard + UI
+// ===================================================
 app.use(
   cors({
     origin: [
@@ -26,32 +26,45 @@ app.use(
   })
 );
 
-// ==============================================
-// ⭐ In-memory device status + history
-// ==============================================
-
-// This stores **all events** ever received
+// ===================================================
+// ⭐ In-memory event + status system
+// ===================================================
+// This holds **EVERY event** sent by Trackblock
 let deviceEvents = [];
 
-// ==============================================
-// 📌 ROOT HEALTH CHECK
-// ==============================================
+// ===================================================
+// 📌 HEALTH CHECK
+// ===================================================
 app.get("/", (req, res) => {
   res.json({ status: "Trackblock backend is LIVE ⚡" });
 });
 
-// ==============================================
-// 📌 DEVICE POSTS DATA → BACKEND
-// URL: POST https://api.oathzsecurity.com/event
-// ==============================================
-app.post("/event", async (req, res) => {
+// ===================================================
+// 📌 GET *LATEST STATUS* OF ALL DEVICES
+// URL: https://api.oathzsecurity.com/status
+// ===================================================
+app.get("/status", (req, res) => {
+  // Build latest snapshot for each device
+  const latest = {};
+
+  for (const evt of deviceEvents) {
+    latest[evt.device_id] = { ...latest[evt.device_id], ...evt };
+  }
+
+  res.json(Object.values(latest));
+});
+
+// ===================================================
+// 📌 DEVICE POSTS EVENT DATA → BACKEND
+// URL: https://api.oathzsecurity.com/event
+// ===================================================
+app.post("/event", (req, res) => {
   try {
     const payload = req.body;
 
-    // Add timestamp automatically
     payload.last_seen = new Date().toISOString();
 
-    // ⭐ Store EVERY event (history!)
+    // ⭐ Store full history — DO NOT overwrite
     deviceEvents.push(payload);
 
     console.log("📥 EVENT:", payload.device_id, payload.event_type);
@@ -59,101 +72,61 @@ app.post("/event", async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error("EVENT ERROR:", err);
-    res.status(500).json({ error: "Failed to save event" });
+    res.status(500).json({ error: "Failed to process event" });
   }
 });
 
-// ==============================================
-// 📌 GET ALL CURRENT STATUS (most recent per device)
-// URL: GET https://api.oathzsecurity.com/status
-// ==============================================
-app.get("/status", (req, res) => {
-  try {
-    // Build latest-device-status list
-    const latest = {};
-
-    deviceEvents.forEach((e) => {
-      latest[e.device_id] = e;
-    });
-
-    res.json(Object.values(latest));
-  } catch (err) {
-    console.error("STATUS ERROR:", err);
-    res.status(500).json({ error: "Failed to fetch status" });
-  }
-});
-
-// ==============================================
-// 📌 GET FULL EVENT HISTORY (ALL DEVICES)
-// URL: GET https://api.oathzsecurity.com/events
-// ==============================================
-app.get("/events", (req, res) => {
-  try {
-    res.json(deviceEvents);
-  } catch (err) {
-    console.error("EVENTS ERROR:", err);
-    res.status(500).json({ error: "Failed to fetch events" });
-  }
-});
-
-// ==============================================
-// 📌 GET EVENT HISTORY FOR A SINGLE DEVICE
-// URL: GET https://api.oathzsecurity.com/device/TB-DEMO-001/events
-// ==============================================
+// ===================================================
+// 📌 GET FULL EVENT HISTORY FOR ONE DEVICE
+// URL: https://api.oathzsecurity.com/device/:id/events
+// ===================================================
 app.get("/device/:id/events", (req, res) => {
-  try {
-    const id = req.params.id;
-    const filtered = deviceEvents.filter((e) => e.device_id === id);
-    res.json(filtered);
-  } catch (err) {
-    console.error("DEVICE EVENTS ERROR:", err);
-    res.status(500).json({ error: "Failed to fetch device events" });
-  }
+  const id = req.params.id;
+
+  // Filter all matching events
+  const history = deviceEvents.filter((e) => e.device_id === id);
+
+  res.json(history);
 });
 
-// ==============================================
+// ===================================================
 // 📌 RESET ALERT ENGINE
 // URL: POST /device/:id/reset
-// ==============================================
+// ===================================================
 app.post("/device/:id/reset", (req, res) => {
   const id = req.params.id;
 
-  try {
-    // Find latest event of this device
-    const latest = [...deviceEvents].reverse().find((x) => x.device_id === id);
+  // Find latest snapshot
+  const latest = [...deviceEvents].reverse().find(e => e.device_id === id);
+  if (!latest) return res.status(404).json({ error: "Device not found" });
 
-    if (!latest) return res.status(404).json({ error: "Device not found" });
+  latest.smsSent = false;
+  latest.callAttempts = 0;
+  latest.callLock = false;
 
-    latest.smsSent = false;
-    latest.callAttempts = 0;
-    latest.callLock = false;
+  console.log(`🔄 ALERTS RESET for ${id}`);
 
-    console.log(`🔄 ALERTS RESET for ${id}`);
-
-    res.json({ ok: true, device_id: id });
-  } catch (err) {
-    console.error("RESET ERROR:", err);
-    res.status(500).json({ error: "Failed to reset alerts" });
-  }
+  res.json({ ok: true, device_id: id });
 });
 
 // ======================================================
-// ⭐ EMAIL NOTIFY LIST — FILE STORAGE
+// ⭐ EMAIL NOTIFY LIST — FILE STORAGE (emails.json)
 // ======================================================
 const emailsFile = path.join(process.cwd(), "emails.json");
 
-// Ensure file exists
+// Create file if missing
 if (!fs.existsSync(emailsFile)) {
   fs.writeFileSync(emailsFile, "[]");
 }
 
-// ==============================================
-// 📌 NOTIFY SIGNUP
+// ======================================================
+// 📌 NOTIFY ROUTE — Add subscriber
 // URL: POST https://api.oathzsecurity.com/notify
-// ==============================================
+// ======================================================
 app.post("/notify", (req, res) => {
   try {
     const { email } = req.body;
+
     if (!email || !email.includes("@")) {
       return res.status(400).json({ error: "Invalid email" });
     }
@@ -162,10 +135,13 @@ app.post("/notify", (req, res) => {
     const list = JSON.parse(raw);
 
     if (list.some((x) => x.email === email)) {
-      return res.json({ message: "Already subscribed" });
+      return res.status(200).json({ message: "Already subscribed" });
     }
 
-    list.push({ email, date: new Date().toISOString() });
+    list.push({
+      email,
+      date: new Date().toISOString(),
+    });
 
     fs.writeFileSync(emailsFile, JSON.stringify(list, null, 2));
 
@@ -179,26 +155,35 @@ app.post("/notify", (req, res) => {
 });
 
 // ======================================================
-// ⭐ ADMIN ROUTES
+// ⭐ ADMIN ROUTES — protected with ADMIN_KEY
 // ======================================================
 const ADMIN_KEY = process.env.ADMIN_KEY || "dev-admin-key";
 
 function requireAdmin(req, res, next) {
   const key = req.query.key;
-  if (!key || key !== ADMIN_KEY) return res.status(403).json({ error: "Forbidden" });
+  if (!key || key !== ADMIN_KEY) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
   next();
 }
 
+// ======================================================
+// 📌 VIEW SUBSCRIBERS (JSON)
+// ======================================================
 app.get("/subscribers", requireAdmin, (req, res) => {
   try {
     const raw = fs.readFileSync(emailsFile, "utf8");
-    res.json(JSON.parse(raw));
+    const list = JSON.parse(raw);
+    res.json(list);
   } catch (err) {
     console.error("SUBSCRIBERS ERROR:", err);
     res.status(500).json({ error: "Failed to read subscribers" });
   }
 });
 
+// ======================================================
+// 📌 EXPORT SUBSCRIBERS CSV
+// ======================================================
 app.get("/export-subscribers", requireAdmin, (req, res) => {
   try {
     const raw = fs.readFileSync(emailsFile, "utf8");
@@ -218,14 +203,12 @@ app.get("/export-subscribers", requireAdmin, (req, res) => {
     res.send(csv);
   } catch (err) {
     console.error("CSV EXPORT ERROR:", err);
-    res.status(500).json({ error: "Failed to export CSV" });
+    res.status(500).json({ error: "Failed to export subscribers" });
   }
 });
 
-// ==============================================
-// 🚀 START SERVER
-// ==============================================
+// ======================================================
+// 🚀 SERVER START
+// ======================================================
 const port = process.env.PORT || 8080;
-app.listen(port, () =>
-  console.log(`🚀 Trackblock backend running on ${port}`)
-);
+app.listen(port, () => console.log(`🚀 Trackblock backend running on ${port}`));
