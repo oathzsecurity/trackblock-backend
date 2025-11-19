@@ -7,35 +7,43 @@ import path from "path";
 const app = express();
 app.use(express.json());
 
-// ⭐ CORS — allow your dashboard + future UI
+// ------------------------------------------------------------------
+//  CORS CONFIG — PRODUCTION SAFE
+// ------------------------------------------------------------------
 app.use(
   cors({
     origin: [
       "http://localhost:3000",
       "http://127.0.0.1:3000",
+
+      // Dashboard UI
       "https://oathz-dashboard.vercel.app",
-      "https://www.oathzsecurity.com",
-      "https://oathzsecurity.com",
+
+      // MAIN OATHZ DOMAINS
+      "https://oathz.com.au",
+      "https://www.oathz.com.au",
     ],
     methods: ["GET", "POST"],
     allowedHeaders: ["Content-Type"],
   })
 );
 
-// ⭐ Temporary in-memory “database”
+// ------------------------------------------------------------------
+//  IN-MEMORY DEVICE EVENT STORAGE (temporary)
+// ------------------------------------------------------------------
 let deviceEvents = [];
 
-// ---------------------------------------------
+// ------------------------------------------------------------------
 //  HEALTH CHECK
-// ---------------------------------------------
+// ------------------------------------------------------------------
 app.get("/", (req, res) => {
   res.json({ status: "Trackblock backend is LIVE ⚡" });
 });
 
-// ---------------------------------------------
-//  GET ALL DEVICE STATUS  (Dashboard calls this)
-//  URL: GET https://api.oathzsecurity.com/status
-// ---------------------------------------------
+// ------------------------------------------------------------------
+//  GET DEVICE STATUS (Dashboard calls this)
+//  URL: https://api.oathzsecurity.com/status
+// ------------------------------------------------------------------
 app.get("/status", async (req, res) => {
   try {
     res.json(deviceEvents);
@@ -45,10 +53,10 @@ app.get("/status", async (req, res) => {
   }
 });
 
-// ---------------------------------------------
-//  DEVICE POSTS DATA → BACKEND
+// ------------------------------------------------------------------
+//  DEVICE SENDS EVENT DATA
 //  URL: POST https://api.oathzsecurity.com/event
-// ---------------------------------------------
+// ------------------------------------------------------------------
 app.post("/event", async (req, res) => {
   try {
     const payload = req.body;
@@ -76,10 +84,10 @@ app.post("/event", async (req, res) => {
   }
 });
 
-// ---------------------------------------------
+// ------------------------------------------------------------------
 //  RESET ALERT ENGINE
 //  URL: POST https://api.oathzsecurity.com/device/:id/reset
-// ---------------------------------------------
+// ------------------------------------------------------------------
 app.post("/device/:id/reset", async (req, res) => {
   const id = req.params.id;
 
@@ -92,7 +100,6 @@ app.post("/device/:id/reset", async (req, res) => {
     d.callLock = false;
 
     console.log(`🔄 ALERTS RESET for ${id}`);
-
     res.json({ ok: true, device_id: id });
   } catch (err) {
     console.error("RESET ERROR:", err);
@@ -100,15 +107,17 @@ app.post("/device/:id/reset", async (req, res) => {
   }
 });
 
-// ---------------------------------------------
-//  EMAIL CAPTURE ENDPOINT FOR LANDING PAGE
+// ------------------------------------------------------------------
+//  NOTIFY EMAIL SUBSCRIPTION
 //  URL: POST https://api.oathzsecurity.com/notify
-// ---------------------------------------------
+// ------------------------------------------------------------------
+
+// Where we store subscriber emails
 const emailsFile = path.join(process.cwd(), "emails.json");
 
 // Ensure file exists
 if (!fs.existsSync(emailsFile)) {
-  fs.writeFileSync(emailsFile, "[]"); // empty list
+  fs.writeFileSync(emailsFile, "[]");
 }
 
 app.post("/notify", async (req, res) => {
@@ -119,15 +128,16 @@ app.post("/notify", async (req, res) => {
       return res.status(400).json({ error: "Invalid email" });
     }
 
-    // Load stored emails
+    // Load existing subscribers
     const raw = fs.readFileSync(emailsFile, "utf8");
     const list = JSON.parse(raw);
 
-    // Prevent duplicates
-    if (list.some((i) => i.email === email)) {
+    // Check for duplicates
+    if (list.some((item) => item.email === email)) {
       return res.status(200).json({ message: "Already subscribed" });
     }
 
+    // Add subscriber
     list.push({
       email,
       date: new Date().toISOString(),
@@ -135,18 +145,18 @@ app.post("/notify", async (req, res) => {
 
     fs.writeFileSync(emailsFile, JSON.stringify(list, null, 2));
 
-    console.log(`📨 NEW SUBSCRIBER: ${email}`);
+    console.log("📨 NEW SUBSCRIBER:", email);
 
-    res.status(200).json({ message: "Subscribed successfully" });
+    res.json({ message: "Subscribed successfully" });
   } catch (err) {
     console.error("NOTIFY ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// ---------------------------------------------
-//  SERVER START
-// ---------------------------------------------
+// ------------------------------------------------------------------
+//  START SERVER
+// ------------------------------------------------------------------
 const port = process.env.PORT || 8080;
 app.listen(port, () =>
   console.log(`🚀 Trackblock backend running on ${port}`)
