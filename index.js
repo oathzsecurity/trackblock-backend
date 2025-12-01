@@ -4,11 +4,33 @@ import axios from "axios";
 import fs from "fs";
 import path from "path";
 import twilio from "twilio";
+import pg from "pg";
 
 const app = express();
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
+
+// =============================
+// POSTGRES SETUP
+// =============================
+const { Pool } = pg;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  // If you ever hit SSL issues with Railway, uncomment this:
+  // ssl: { rejectUnauthorized: false },
+});
+
+pool
+  .connect()
+  .then((client) => {
+    console.log("✅ Connected to Postgres");
+    client.release();
+  })
+  .catch((err) => {
+    console.error("❌ Postgres connection error:", err);
+  });
 
 // =============================
 // ENV + TWILIO SETUP
@@ -45,6 +67,7 @@ app.use(
       "https://www.oathz.com.au",
       "https://oathzsecurity.com",
       "https://www.oathzsecurity.com",
+      "https://dashboard.oathzsecurity.com", // NEW dashboard domain
     ],
     methods: ["GET", "POST"],
     allowedHeaders: ["Content-Type"],
@@ -77,7 +100,7 @@ app.get("/", (req, res) => {
 });
 
 // =============================
-// GET LATEST STATUS OF ALL DEVICES
+// GET LATEST STATUS OF ALL DEVICES (from memory)
 // =============================
 app.get("/status", (req, res) => {
   const latest = {};
@@ -188,6 +211,24 @@ app.post("/event", async (req, res) => {
 
     console.log("📥 EVENT:", payload.device_id, payload.event_type);
 
+    // 🔥 NEW: persist event to Postgres
+    try {
+      await pool.query(
+        `
+        INSERT INTO device_logs (device_id, event_type, latitude, longitude, created_at)
+        VALUES ($1, $2, $3, $4, NOW())
+      `,
+        [
+          payload.device_id || null,
+          payload.event_type || payload.state || null,
+          payload.latitude ?? null,
+          payload.longitude ?? null,
+        ]
+      );
+    } catch (dbErr) {
+      console.error("❌ DB INSERT ERROR:", dbErr);
+    }
+
     await runAlertEngine(payload);
 
     res.json({ ok: true });
@@ -198,7 +239,7 @@ app.post("/event", async (req, res) => {
 });
 
 // =============================
-// FULL EVENT HISTORY FOR ONE DEVICE
+// FULL EVENT HISTORY FOR ONE DEVICE (in-memory)
 // =============================
 app.get("/device/:id/events", (req, res) => {
   const id = req.params.id;
@@ -317,24 +358,32 @@ app.get("/export-subscribers", requireAdmin, (req, res) => {
 });
 
 // =============================
-// NEW: DEVICES LIST FOR UI DASHBOARD
+// DEVICES LIST FOR UI DASHBOARD (from Postgres)
 // =============================
-app.get("/devices", (req, res) => {
+app.get("/devices", async (req, res) => {
   try {
-    const latest = {};
+    const result = await pool.query(
+      `
+      SELECT DISTINCT ON (device_id)
+        device_id,
+        event_type,
+        latitude,
+        longitude,
+        created_at
+      FROM device_logs
+      ORDER BY device_id, created_at DESC
+    `
+    );
 
-    for (const evt of deviceEvents) {
-      latest[evt.device_id] = {
-        device_id: evt.device_id,
-        last_seen: evt.last_seen,
-        state: evt.state || evt.event_type || "unknown",
-        gps_fix: evt.gps_fix,
-        latitude: evt.latitude,
-        longitude: evt.longitude,
-      };
-    }
-
-    res.json(Object.values(latest));
+    res.json(
+      result.rows.map((row) => ({
+        device_id: row.device_id,
+        state: row.event_type,
+        latitude: row.latitude,
+        longitude: row.longitude,
+        last_seen: row.created_at,
+      }))
+    );
   } catch (err) {
     console.error("❌ /devices error:", err);
     res.status(500).json({ error: "Failed to load devices" });
