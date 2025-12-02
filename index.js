@@ -1,6 +1,5 @@
 import express from "express";
 import cors from "cors";
-import axios from "axios";
 import twilio from "twilio";
 import pg from "pg";
 
@@ -10,7 +9,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
 // =============================
-// POSTGRES SETUP (HARDENED)
+// POSTGRES SETUP
 // =============================
 const { Pool } = pg;
 
@@ -19,12 +18,12 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// Small wrapper for convenience
+// DB wrapper
 const db = {
   query: (text, params) => pool.query(text, params),
 };
 
-// Test DB connection
+// Confirm DB connection
 (async () => {
   try {
     await db.query("SELECT NOW()");
@@ -35,14 +34,13 @@ const db = {
 })();
 
 // =============================
-// ENV + TWILIO SETUP
+// TWILIO (optional for now)
 // =============================
 const TWILIO_SID =
   process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_SID || "";
 const TWILIO_TOKEN =
   process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_TOKEN || "";
 const ALERT_PHONE = process.env.ALERT_PHONE || "";
-
 const client = twilio(TWILIO_SID, TWILIO_TOKEN);
 
 // =============================
@@ -54,60 +52,45 @@ app.get("/", (req, res) => {
 
 // =============================
 // POST /event
-// Device → Server → Database
+// DEVICE → SERVER → DATABASE
 // =============================
 app.post("/event", async (req, res) => {
-  console.log("📥 Incoming /event POST");
-  console.log("Body:", req.body);
+  console.log("📥 Incoming /event");
+  console.log(req.body);
 
   try {
-    const {
-      device_id,
-      latitude,
-      longitude,
-      mac_addresses,
-      timestamp,
-    } = req.body;
+    const { device_id, latitude, longitude, timestamp } = req.body;
 
     if (!device_id) {
       return res.status(400).json({ error: "Missing device_id" });
     }
 
-    const macs = Array.isArray(mac_addresses) ? mac_addresses : [];
-
     const result = await db.query(
       `
-      INSERT INTO events
-      (device_id, latitude, longitude, mac_addresses, timestamp)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO events (device_id, latitude, longitude, timestamp)
+      VALUES ($1, $2, $3, $4)
       RETURNING *
       `,
       [
         device_id,
         latitude || null,
         longitude || null,
-        macs,
         timestamp || new Date().toISOString(),
       ]
     );
 
-    console.log("✅ DB INSERT SUCCESS:", result.rows[0]);
+    console.log("✅ DB INSERT:", result.rows[0]);
 
-    res.json({
-      status: "ok",
-      inserted: result.rows[0],
-    });
+    res.json({ status: "ok", inserted: result.rows[0] });
   } catch (err) {
-    console.error("❌ ERROR inserting event:", err);
-    res.status(500).json({
-      error: "DB insert failed",
-      details: err.message,
-    });
+    console.error("❌ DB INSERT ERROR:", err);
+    res.status(500).json({ error: "DB insert failed", details: err.message });
   }
 });
 
 // =============================
 // GET /devices
+// List all devices + last seen
 // =============================
 app.get("/devices", async (req, res) => {
   try {
@@ -127,6 +110,7 @@ app.get("/devices", async (req, res) => {
 
 // =============================
 // GET /device/:id/events
+// Raw event history
 // =============================
 app.get("/device/:id/events", async (req, res) => {
   try {
@@ -151,17 +135,21 @@ app.get("/device/:id/events", async (req, res) => {
 
 // =============================
 // GET /device/:id/status
-// REQUIRED BY UI MAP
+// The MOST IMPORTANT ENDPOINT
+// UI uses it to show the map
 // =============================
 app.get("/device/:id/status", async (req, res) => {
   const { id } = req.params;
 
   try {
+    // Only fetch REAL gps entries
     const result = await db.query(
       `
       SELECT latitude, longitude, timestamp
       FROM events
       WHERE device_id = $1
+        AND latitude IS NOT NULL
+        AND longitude IS NOT NULL
       ORDER BY timestamp DESC
       LIMIT 1;
       `,
@@ -185,7 +173,6 @@ app.get("/device/:id/status", async (req, res) => {
       longitude: row.longitude,
       last_seen: row.timestamp,
     });
-
   } catch (err) {
     console.error("❌ STATUS ERROR:", err);
     res.status(500).json({ error: "Failed to load device status" });
