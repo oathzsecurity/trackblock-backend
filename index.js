@@ -5,7 +5,7 @@ import twilio from "twilio";
 import pg from "pg";
 
 const app = express();
-
+app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
@@ -16,14 +16,15 @@ const { Pool } = pg;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // Railway friendly
+  ssl: { rejectUnauthorized: false },
 });
 
-// Lightweight DB helper to avoid repeated connect/release
+// Small wrapper for convenience
 const db = {
   query: (text, params) => pool.query(text, params),
 };
 
+// Test DB connection
 (async () => {
   try {
     await db.query("SELECT NOW()");
@@ -52,7 +53,7 @@ app.get("/", (req, res) => {
 });
 
 // =============================
-// EVENT ENDPOINT
+// POST /event
 // Device → Server → Database
 // =============================
 app.post("/event", async (req, res) => {
@@ -74,30 +75,31 @@ app.post("/event", async (req, res) => {
 
     const macs = Array.isArray(mac_addresses) ? mac_addresses : [];
 
-    const queryText = `
+    const result = await db.query(
+      `
       INSERT INTO events
       (device_id, latitude, longitude, mac_addresses, timestamp)
       VALUES ($1, $2, $3, $4, $5)
       RETURNING *
-    `;
-
-    const result = await db.query(queryText, [
-      device_id,
-      latitude || null,
-      longitude || null,
-      macs,
-      timestamp || new Date().toISOString(),
-    ]);
+      `,
+      [
+        device_id,
+        latitude || null,
+        longitude || null,
+        macs,
+        timestamp || new Date().toISOString(),
+      ]
+    );
 
     console.log("✅ DB INSERT SUCCESS:", result.rows[0]);
 
-    return res.json({
+    res.json({
       status: "ok",
       inserted: result.rows[0],
     });
   } catch (err) {
     console.error("❌ ERROR inserting event:", err);
-    return res.status(500).json({
+    res.status(500).json({
       error: "DB insert failed",
       details: err.message,
     });
@@ -105,19 +107,17 @@ app.post("/event", async (req, res) => {
 });
 
 // =============================
-// NEW: GET /devices
-// Returns list of devices + last_seen
+// GET /devices
 // =============================
 app.get("/devices", async (req, res) => {
   try {
-    const query = `
+    const result = await db.query(`
       SELECT device_id, MAX(timestamp) AS last_seen
       FROM events
       GROUP BY device_id
       ORDER BY last_seen DESC;
-    `;
+    `);
 
-    const result = await db.query(query);
     res.json(result.rows);
   } catch (err) {
     console.error("❌ Error fetching devices:", err);
@@ -126,21 +126,22 @@ app.get("/devices", async (req, res) => {
 });
 
 // =============================
-// NEW: GET /device/:id/events
-// Returns full event list for device
+// GET /device/:id/events
 // =============================
 app.get("/device/:id/events", async (req, res) => {
   try {
     const deviceId = req.params.id;
 
-    const query = `
+    const result = await db.query(
+      `
       SELECT *
       FROM events
       WHERE device_id = $1
       ORDER BY timestamp DESC;
-    `;
+      `,
+      [deviceId]
+    );
 
-    const result = await db.query(query, [deviceId]);
     res.json(result.rows);
   } catch (err) {
     console.error("❌ Error fetching device events:", err);
