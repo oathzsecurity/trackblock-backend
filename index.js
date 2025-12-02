@@ -41,6 +41,7 @@ const TWILIO_SID =
 const TWILIO_TOKEN =
   process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_TOKEN || "";
 const ALERT_PHONE = process.env.ALERT_PHONE || "";
+
 const client = twilio(TWILIO_SID, TWILIO_TOKEN);
 
 // =============================
@@ -71,9 +72,7 @@ app.post("/event", async (req, res) => {
       return res.status(400).json({ error: "Missing device_id" });
     }
 
-    const macs = Array.isArray(mac_addresses)
-      ? mac_addresses
-      : [];
+    const macs = Array.isArray(mac_addresses) ? mac_addresses : [];
 
     const queryText = `
       INSERT INTO events
@@ -102,6 +101,50 @@ app.post("/event", async (req, res) => {
       error: "DB insert failed",
       details: err.message,
     });
+  }
+});
+
+// =============================
+// NEW: GET /devices
+// Returns list of devices + last_seen
+// =============================
+app.get("/devices", async (req, res) => {
+  try {
+    const query = `
+      SELECT device_id, MAX(timestamp) AS last_seen
+      FROM events
+      GROUP BY device_id
+      ORDER BY last_seen DESC;
+    `;
+
+    const result = await db.query(query);
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Error fetching devices:", err);
+    res.status(500).json({ error: "Failed to fetch devices" });
+  }
+});
+
+// =============================
+// NEW: GET /device/:id/events
+// Returns full event list for device
+// =============================
+app.get("/device/:id/events", async (req, res) => {
+  try {
+    const deviceId = req.params.id;
+
+    const query = `
+      SELECT *
+      FROM events
+      WHERE device_id = $1
+      ORDER BY timestamp DESC;
+    `;
+
+    const result = await db.query(query, [deviceId]);
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Error fetching device events:", err);
+    res.status(500).json({ error: "Failed to fetch events" });
   }
 });
 
