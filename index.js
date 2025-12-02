@@ -150,6 +150,49 @@ app.get("/device/:id/events", async (req, res) => {
 });
 
 // =============================
+// GET /device/:id/status
+// REQUIRED BY UI MAP
+// =============================
+app.get("/device/:id/status", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const result = await db.query(
+      `
+      SELECT latitude, longitude, timestamp
+      FROM events
+      WHERE device_id = $1
+      ORDER BY timestamp DESC
+      LIMIT 1;
+      `,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({
+        device_id: id,
+        latitude: null,
+        longitude: null,
+        last_seen: null,
+      });
+    }
+
+    const row = result.rows[0];
+
+    res.json({
+      device_id: id,
+      latitude: row.latitude,
+      longitude: row.longitude,
+      last_seen: row.timestamp,
+    });
+
+  } catch (err) {
+    console.error("❌ STATUS ERROR:", err);
+    res.status(500).json({ error: "Failed to load device status" });
+  }
+});
+
+// =============================
 // HEALTH CHECK
 // =============================
 app.get("/test-log", (req, res) => {
