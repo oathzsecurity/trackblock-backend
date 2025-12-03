@@ -221,5 +221,13 @@ app.get("/device/:id/events", async (req, res) => {
 });
 
 // =============================
+// TEST ENDPOINT
+// =============================
+app.get("/test-log", (req, res) => {
+  res.json({ ok: true, message: "Trackblock backend is alive" });
+});
+
+
+// =============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Backend running on port ${PORT}`));
