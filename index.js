@@ -68,7 +68,6 @@ app.get("/", (req, res) => {
 // TWILIO WEBHOOKS (THE MISSING PIECE)
 // =============================
 
-const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
