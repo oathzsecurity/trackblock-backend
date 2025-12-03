@@ -295,7 +295,7 @@ app.post("/twilio/voice", (req, res) => {
   res.send(`
     <?xml version="1.0" encoding="UTF-8"?>
     <Response>
-      <Say voice="alice">
+      <Say voice="man">
         Trackblock is on the move. Check your dashboard now for current live position.
         Alert the authorities — call the police.
         Repeat. Trackblock is on the move.
