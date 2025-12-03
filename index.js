@@ -31,26 +31,21 @@ const db = { query: (text, params) => pool.query(text, params) };
 // TWILIO SETUP
 // =============================
 const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_SID;
-const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_TOKEN;
+const TWILIO_TOKEN =
+  process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_TOKEN;
+
 const ALERT_PHONE = process.env.ALERT_PHONE || "";
-const FROM_NUMBER = process.env.FROM_NUMBER; // Your Twilio number
+const FROM_NUMBER = process.env.FROM_NUMBER;
 
 const twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
 
 // =============================
 // DEVICE STATE MEMORY
 // =============================
-/**
- * Stores:
- *  - lastLat, lastLon
- *  - lastMode ("HEARTBEAT" | "CHASE" | "OFFLINE")
- *  - lastTimestamp
- */
 const deviceState = {};
 
-// Distance helper
 function distanceMeters(lat1, lon1, lat2, lon2) {
-  const toRad = v => (v * Math.PI) / 180;
+  const toRad = (v) => (v * Math.PI) / 180;
   const R = 6371000;
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
@@ -70,6 +65,34 @@ app.get("/", (req, res) => {
 });
 
 // =============================
+// TWILIO WEBHOOKS (THE MISSING PIECE)
+// =============================
+
+// Voice Call Webhook
+app.post("/twilio/voice", (req, res) => {
+  res.type("text/xml");
+  res.send(`
+    <?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+      <Say voice="alice">
+        Trackblock alert. Your device has entered chase mode. Check the dashboard immediately.
+      </Say>
+    </Response>
+  `);
+});
+
+// SMS Webhook
+app.post("/twilio/sms", (req, res) => {
+  res.type("text/xml");
+  res.send(`
+    <?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+      <Message>Trackblock alert received.</Message>
+    </Response>
+  `);
+});
+
+// =============================
 // EVENT INGEST + CHASE DETECTION
 // =============================
 app.post("/event", async (req, res) => {
@@ -81,20 +104,23 @@ app.post("/event", async (req, res) => {
     return res.status(400).json({ error: "Missing device_id" });
   }
 
-  // Insert into DB
+  // DB insert
   try {
     await db.query(
       `INSERT INTO events (device_id, latitude, longitude, timestamp)
        VALUES ($1, $2, $3, $4)`,
-      [device_id, latitude || null, longitude || null, timestamp || new Date().toISOString()]
+      [
+        device_id,
+        latitude || null,
+        longitude || null,
+        timestamp || new Date().toISOString(),
+      ]
     );
   } catch (err) {
     console.error("❌ DB INSERT FAILED:", err);
   }
 
-  // =============================
-  // DEVICE ONLINE / OFFLINE STATE
-  // =============================
+  // DEVICE ONLINE/OFFLINE STATE
   const state = deviceState[device_id] || {
     lastMode: "OFFLINE",
     lastLat: null,
@@ -111,15 +137,11 @@ app.post("/event", async (req, res) => {
     !isNaN(latitude) &&
     !isNaN(longitude);
 
-  // If no GPS, treat as heartbeat-only
   if (!hasGPS) {
     deviceState[device_id] = state;
     return res.json({ status: "ok" });
   }
 
-  // =============================
-  // ONLINE = last < 20 seconds
-  // =============================
   const isOnline = Date.now() - nowTs < 20000;
 
   if (!isOnline) {
@@ -128,9 +150,7 @@ app.post("/event", async (req, res) => {
     return res.json({ status: "ok" });
   }
 
-  // =============================
-  // MOVEMENT DETECTION
-  // =============================
+  // MOVE DETECTION
   let isChase = false;
 
   if (state.lastLat !== null && state.lastLon !== null) {
@@ -146,34 +166,28 @@ app.post("/event", async (req, res) => {
     }
   }
 
-  // Save latest GPS
   state.lastLat = latitude;
   state.lastLon = longitude;
 
-  // =============================
-  // MODE TRANSITIONS
-  // =============================
   const previousMode = state.lastMode;
   const nextMode = isChase ? "CHASE" : "HEARTBEAT";
 
   state.lastMode = nextMode;
   deviceState[device_id] = state;
 
-  // =============================
-  // TWILIO ALERT: ONLY ON TRANSITION INTO CHASE
-  // =============================
+  // TWILIO ALERT: transition into chase
   if (previousMode !== "CHASE" && nextMode === "CHASE") {
     console.log(`🚨 CHASE MODE ACTIVATED for ${device_id}`);
 
     console.log("📞 Sending Twilio CALL...");
     twilioClient.calls
       .create({
-        url: "http://demo.twilio.com/docs/voice.xml",
+        url: "https://api.oathzsecurity.com/twilio/voice",
         to: ALERT_PHONE,
         from: FROM_NUMBER,
       })
-      .then(call => console.log("📞 Call SID:", call.sid))
-      .catch(err => console.error("❌ CALL ERROR:", err));
+      .then((call) => console.log("📞 Call SID:", call.sid))
+      .catch((err) => console.error("❌ CALL ERROR:", err));
 
     console.log("📩 Sending Twilio SMS…");
     twilioClient.messages
@@ -182,8 +196,8 @@ app.post("/event", async (req, res) => {
         to: ALERT_PHONE,
         from: FROM_NUMBER,
       })
-      .then(msg => console.log("📩 SMS SID:", msg.sid))
-      .catch(err => console.error("❌ SMS ERROR:", err));
+      .then((msg) => console.log("📩 SMS SID:", msg.sid))
+      .catch((err) => console.error("❌ SMS ERROR:", err));
   }
 
   res.json({ status: "ok" });
