@@ -68,11 +68,6 @@ app.get("/", (req, res) => {
 // TWILIO WEBHOOKS (THE MISSING PIECE)
 // =============================
 
-import express from "express";
-import cors from "cors";
-import twilio from "twilio";
-import pg from "pg";
-
 const app = express();
 app.use(cors());
 app.use(express.json());
