@@ -30,21 +30,20 @@ const db = { query: (text, params) => pool.query(text, params) };
 // =============================
 // TWILIO SETUP
 // =============================
-const TWILIO_SID =
-  process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_SID;
-const TWILIO_TOKEN =
-  process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_TOKEN;
+const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_SID;
+const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_TOKEN;
 
 const ALERT_PHONE = process.env.ALERT_PHONE;
 const FROM_NUMBER = process.env.FROM_NUMBER;
 
-const twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
+const twilioClient =
+  TWILIO_SID && TWILIO_TOKEN ? twilio(TWILIO_SID, TWILIO_TOKEN) : null;
 
-console.log("📞 Twilio Settings Loaded:", {
-  ALERT_PHONE,
-  FROM_NUMBER,
-  SID: TWILIO_SID ? "OK" : "MISSING",
-});
+if (!twilioClient) {
+  console.log("⚠️ Twilio client NOT initialised (missing env vars)");
+} else {
+  console.log("✅ Twilio client loaded");
+}
 
 // =============================
 // IN-MEMORY DEVICE STATE
@@ -52,10 +51,10 @@ console.log("📞 Twilio Settings Loaded:", {
 const deviceState = {};
 
 function distanceMeters(lat1, lon1, lat2, lon2) {
-  const toRad = v => (v * Math.PI) / 180;
+  const toRad = (v) => (v * Math.PI) / 180;
   const R = 6371000;
   const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lat2 - lon1);
+  const dLon = toRad(lon2 - lon1);
   const a =
     Math.sin(dLat / 2) ** 2 +
     Math.cos(toRad(lat1)) *
@@ -75,26 +74,29 @@ app.get("/", (req, res) => {
 // EVENT INGESTION
 // =============================
 app.post("/event", async (req, res) => {
-  const { device_id, latitude, longitude, timestamp, state: fwState } = req.body;
+  const { device_id, latitude, longitude, timestamp } = req.body;
 
-  console.log("📥 EVENT RECEIVED:", req.body);
+  console.log("📥 EVENT:", req.body);
 
   if (!device_id) {
     return res.status(400).json({ error: "Missing device_id" });
   }
 
-  // Store event in DB
   try {
     await db.query(
       `INSERT INTO events (device_id, latitude, longitude, timestamp)
        VALUES ($1, $2, $3, $4)`,
-      [device_id, latitude || null, longitude || null, timestamp || new Date().toISOString()]
+      [
+        device_id,
+        latitude || null,
+        longitude || null,
+        timestamp || new Date().toISOString(),
+      ]
     );
   } catch (err) {
     console.error("❌ DB INSERT FAILED:", err);
   }
 
-  // Load previous state
   const state =
     deviceState[device_id] || {
       lastMode: "OFFLINE",
@@ -125,7 +127,6 @@ app.post("/event", async (req, res) => {
     return res.json({ status: "ok" });
   }
 
-  // Movement detection
   let isChase = false;
 
   if (state.lastLat !== null && state.lastLon !== null) {
@@ -145,57 +146,45 @@ app.post("/event", async (req, res) => {
   state.lastLon = longitude;
 
   const previousMode = state.lastMode;
-
-  // =============================
-  // 🔥 NEW — STATE ALIGNMENT FIX
-  // =============================
-  let nextMode = isChase ? "CHASE" : "HEARTBEAT";
-
-  // Firmware sends: demo_armed, demo_chase, etc.
-  if (typeof fwState === "string") {
-    if (fwState.toLowerCase().includes("chase")) {
-      nextMode = "CHASE";
-    }
-  }
-  // =============================
+  const nextMode = isChase ? "CHASE" : "HEARTBEAT";
 
   state.lastMode = nextMode;
   deviceState[device_id] = state;
 
-  console.log(`🔄 Mode Transition: ${previousMode} → ${nextMode}`);
-
   // =============================
-  // 🚨 FIRE TWILIO ALERT
+  // CHASE TRIGGER → CALL + SMS
   // =============================
   if (previousMode !== "CHASE" && nextMode === "CHASE") {
-    console.log(`🚨 TRIGGERING TWILIO: ${device_id}`);
+    console.log(`🚨 CHASE MODE for ${device_id}`);
 
-    // Call
-    twilioClient.calls
-      .create({
-        url: `https://api.oathzsecurity.com/twilio/voice?device_id=${device_id}`,
-        to: ALERT_PHONE,
-        from: FROM_NUMBER,
-      })
-      .then(() => console.log("📞 Twilio CALL sent"))
-      .catch(err => console.error("❌ CALL ERROR:", err));
+    if (twilioClient && ALERT_PHONE && FROM_NUMBER) {
+      // CALL
+      twilioClient.calls
+        .create({
+          url: "https://api.oathzsecurity.com/twilio/voice",
+          to: ALERT_PHONE,
+          from: FROM_NUMBER,
+        })
+        .catch((err) => console.error("❌ CALL ERROR:", err));
 
-    // SMS
-    twilioClient.messages
-      .create({
-        body: `Your Trackblock ${device_id} is on the move! Live: https://dashboard.oathzsecurity.com/devices/${device_id}`,
-        to: ALERT_PHONE,
-        from: FROM_NUMBER,
-      })
-      .then(() => console.log("📨 Twilio SMS sent"))
-      .catch(err => console.error("❌ SMS ERROR:", err));
+      // SMS
+      twilioClient.messages
+        .create({
+          body: `Your Trackblock ${device_id} is on the move! Live: https://dashboard.oathzsecurity.com/devices/${device_id}`,
+          to: ALERT_PHONE,
+          from: FROM_NUMBER,
+        })
+        .catch((err) => console.error("❌ SMS ERROR:", err));
+    } else {
+      console.log("⚠️ Twilio disabled — env vars missing");
+    }
   }
 
   res.json({ status: "ok" });
 });
 
 // =============================
-// TWILIO WEBHOOKS
+// TWILIO WEBHOOK (VOICE)
 // =============================
 app.post("/twilio/voice", (req, res) => {
   res.type("text/xml");
@@ -203,12 +192,15 @@ app.post("/twilio/voice", (req, res) => {
     <Response>
       <Say voice="man">
         Trackblock is on the move. Check your dashboard now.
-        Alert the authorities immediately. Repeat. Trackblock is on the move.
+        Alert authorities immediately. Repeat. Trackblock is on the move.
       </Say>
     </Response>
   `);
 });
 
+// =============================
+// TWILIO WEBHOOK (SMS)
+// =============================
 app.post("/twilio/sms", (req, res) => {
   res.type("text/xml");
   res.send(`
@@ -253,12 +245,12 @@ app.get("/device/:id/events", async (req, res) => {
 });
 
 // =============================
-// TEST ENDPOINT
-// =============================
 app.get("/test-log", (req, res) => {
   res.json({ ok: true, message: "Trackblock backend is alive" });
 });
 
 // =============================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Backend running on port ${PORT}`));
+app.listen(PORT, () =>
+  console.log(`🚀 Backend running on port ${PORT}`)
+);
