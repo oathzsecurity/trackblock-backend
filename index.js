@@ -1,393 +1,419 @@
+}
+})();
 
-const app = express();
+// =============================
+// TWILIO SETUP
+// =============================
+const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_SID;
+const TWILIO_TOKEN =
+  process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_TOKEN;
 
-// Twilio sends x-www-form-urlencoded on callbacks
+const ALERT_PHONE = process.env.ALERT_PHONE || "";
+const FROM_NUMBER = process.env.FROM_NUMBER;
+
+const twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
+
+// =============================
+// DEVICE STATE MEMORY
+// =============================
+const deviceState = {};
+
+function distanceMeters(lat1, lon1, lat2, lon2) {
+  const toRad = (v) => (v * Math.PI) / 180;
+  const R = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) ** 2;
+  return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+}
+
+// =============================
+// ROOT
+// =============================
+app.get("/", (req, res) => {
+  res.json({ status: "Trackblock server running" });
+});
+
+// =============================
+// TWILIO WEBHOOKS (THE MISSING PIECE)
+// =============================
+
+app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-// ===================================================
-// ⭐ ENV + TWILIO SETUP
-// ===================================================
 // =============================
-// ENV + TWILIO SETUP
+// POSTGRES SETUP
 // =============================
-const TWILIO_SID =
-process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_SID || "";
-const TWILIO_TOKEN =
-process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_TOKEN || "";
-const ALERT_PHONE = process.env.ALERT_PHONE;          // destination
-const TWILIO_FROM = process.env.TWILIO_FROM;          // your Twilio number
-const TWIML_VOICE_URL = process.env.TWIML_VOICE_URL;  // TwiML URL for calls
+const { Pool } = pg;
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+const db = { query: (text, params) => pool.query(text, params) };
+
+(async () => {
+  try {
+    await db.query("SELECT NOW()");
+    console.log("✅ Connected to Postgres");
+  } catch (err) {
+    console.error("❌ Postgres error:", err);
+  }
+})();
+
+// =============================
+// TWILIO SETUP
+// =============================
+const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_SID;
+const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_TOKEN;
+
+const ALERT_PHONE = process.env.ALERT_PHONE;   // Destination (user)
+const FROM_NUMBER = process.env.FROM_NUMBER;   // Twilio number
 const ALERT_PHONE = process.env.ALERT_PHONE;
-const TWILIO_FROM = process.env.TWILIO_FROM;
-const TWIML_VOICE_URL = process.env.TWIML_VOICE_URL;
+const FROM_NUMBER = process.env.FROM_NUMBER;
 
-const MAX_CALL_ATTEMPTS = 10;
+const twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
 
-let twilioClient: any = null;
-let twilioClient = null;
-if (TWILIO_SID && TWILIO_TOKEN) {
-twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
-console.log("✅ Twilio client initialised");
-} else {
-console.log("⚠️ Twilio credentials missing — call engine disabled");
+@@ -107,7 +43,6 @@ const twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
+// =============================
+const deviceState = {};
+
+// distance helper
+function distanceMeters(lat1, lon1, lat2, lon2) {
+const toRad = v => (v * Math.PI) / 180;
+const R = 6371000;
+@@ -140,7 +75,6 @@ app.post("/event", async (req, res) => {
+return res.status(400).json({ error: "Missing device_id" });
 }
 
-// ===================================================
-// ⭐ CORS — allow your dashboard + UI
-// ===================================================
-// =============================
-// CORS
-// =============================
-app.use(
-cors({
-origin: [
-"http://localhost:3000",
-"http://127.0.0.1:3000",
-"https://oathz-dashboard.vercel.app",
-      "https://www.oathz.com.au",
-"https://oathz.com.au",
-      "https://www.oathzsecurity.com",
-      "https://www.oathz.com.au",
-"https://oathzsecurity.com",
-      "https://www.oathzsecurity.com",
-],
-methods: ["GET", "POST"],
-allowedHeaders: ["Content-Type"],
+  // store event
+try {
+await db.query(
+`INSERT INTO events (device_id, latitude, longitude, timestamp)
+@@ -151,7 +85,6 @@ app.post("/event", async (req, res) => {
+console.error("❌ DB INSERT FAILED:", err);
+}
+
+  // load state
+const state =
+deviceState[device_id] || {
+lastMode: "OFFLINE",
+@@ -169,22 +102,19 @@ app.post("/event", async (req, res) => {
+!isNaN(latitude) &&
+!isNaN(longitude);
+
+  // heartbeat-only (no GPS)
+if (!hasGPS) {
+deviceState[device_id] = state;
+return res.json({ status: "ok" });
+}
+
+  // online?
+  const isOnline = Date.now() - nowTs < 20_000;
+  const isOnline = Date.now() - nowTs < 20000;
+
+if (!isOnline) {
+state.lastMode = "OFFLINE";
+deviceState[device_id] = state;
+return res.json({ status: "ok" });
+}
+
+  // movement detection
+let isChase = false;
+
+if (state.lastLat !== null && state.lastLon !== null) {
+@@ -200,248 +130,64 @@ app.post("/event", async (req, res) => {
+}
+}
+
+  // update stored GPS location
+state.lastLat = latitude;
+state.lastLon = longitude;
+
+  // compute next mode
+const previousMode = state.lastMode;
+const nextMode = isChase ? "CHASE" : "HEARTBEAT";
+
+state.lastMode = nextMode;
+deviceState[device_id] = state;
+
+  // =============================
+  // TWILIO ALERT — ONLY WHEN ENTERING CHASE
+  // =============================
+if (previousMode !== "CHASE" && nextMode === "CHASE") {
+    console.log(`🚨 CHASE MODE ACTIVATED for ${device_id}`);
+    console.log(`🚨 CHASE MODE for ${device_id}`);
+
+    // ---- VOICE CALL ----
+    console.log("📞 Sending Twilio CALL...");
+twilioClient.calls
+.create({
+url: `https://api.oathzsecurity.com/twilio/voice?device_id=${device_id}`,
+to: ALERT_PHONE,
+from: FROM_NUMBER,
 })
+      .then(call => console.log("📞 Call SID:", call.sid))
+.catch(err => console.error("❌ CALL ERROR:", err));
+
+    // ---- SMS ----
+    console.log("📩 Sending Twilio SMS…");
+twilioClient.messages
+.create({
+        body: `Your Trackblock ${device_id} is on the move! Live tracking: https://dashboard.oathzsecurity.com/devices/${device_id}`,
+        body: `Your Trackblock ${device_id} is on the move! Live: https://dashboard.oathzsecurity.com/devices/${device_id}`,
+to: ALERT_PHONE,
+from: FROM_NUMBER,
+})
+      .then(msg => console.log("📩 SMS SID:", msg.sid))
+.catch(err => console.error("❌ SMS ERROR:", err));
+}
+
+res.json({ status: "ok" });
+});
+
+// =============================
+// GET /devices
+// =============================
+app.get("/devices", async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT device_id, MAX(timestamp) AS last_seen
+      FROM events
+      GROUP BY device_id
+      ORDER BY last_seen DESC;
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ devices error:", err);
+    res.status(500).json({ error: "Failed to fetch devices" });
+  }
+});
+
+// =============================
+// GET /device/:id/events
+// =============================
+app.get("/device/:id/events", async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT * FROM events
+       WHERE device_id = $1
+       ORDER BY timestamp ASC`,
+      [req.params.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ events error:", err);
+    res.status(500).json({ error: "Failed to fetch events" });
+  }
+});
+
+// =============================
+// TWILIO VOICE WEBHOOK
+// TWILIO WEBHOOKS
+// =============================
+app.post("/twilio/voice", (req, res) => {
+  const deviceId = req.query.device_id || "your Trackblock";
+
+res.type("text/xml");
+res.send(`
+    <?xml version="1.0" encoding="UTF-8"?>
+   <Response>
+     <Say voice="man">
+        Trackblock is on the move. Check your dashboard now for current live position.
+        Alert the authorities — call the police.
+        Repeat. Trackblock is on the move.
+        Trackblock is on the move. Check your dashboard now.
+        Alert authorities immediately. Repeat. Trackblock is on the move.
+     </Say>
+   </Response>
+ `);
+});
+
+// =============================
+// TWILIO SMS WEBHOOK
+// =============================
+app.post("/twilio/sms", (req, res) => {
+  const deviceId = req.query.device_id || "unknown";
+  const link = `https://dashboard.oathzsecurity.com/devices/${deviceId}`;
+
+res.type("text/xml");
+res.send(`
+    <?xml version="1.0" encoding="UTF-8"?>
+   <Response>
+      <Message>
+        Your Trackblock is on the move! Check your dashboard NOW for current live position. ${link}
+      </Message>
+      <Message>Your Trackblock is on the move! Check your dashboard now.</Message>
+   </Response>
+ `);
+});
+
+// =============================
+// TEST ENDPOINT
+// =============================
+app.get("/test-log", (req, res) => {
+  res.json({ ok: true });
+});
+
+// =============================
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () =>
+  console.log(`🚀 Backend running on port ${PORT}`)
 );
 
-// ===================================================
-// ⭐ In-memory event + status + alert engine
-// ===================================================
-
-// Every event from every device (history)
-let deviceEvents: any[] = [];
-
-// Per-device alert state (engine)
-interface AlertState {
-  smsSent: boolean;
-  callAttempts: number;
-  callLock: boolean;
-}
 // =============================
-// EVENT + STATUS + ALERT ENGINE
-// =============================
-let deviceEvents = [];
-
-const alertState: Record<string, AlertState> = {};
-const alertState = {};
-
-// Helper to get / init state
-function getAlertState(deviceId: string): AlertState {
-function getAlertState(deviceId) {
-if (!alertState[deviceId]) {
-alertState[deviceId] = {
-smsSent: false,
-@@ -79,44 +68,40 @@ function getAlertState(deviceId: string): AlertState {
-return alertState[deviceId];
-}
-
-// ===================================================
-// 📌 HEALTH CHECK
-// ===================================================
-// =============================
-// HEALTH CHECK
-// =============================
-app.get("/", (req, res) => {
-res.json({ status: "Trackblock backend is LIVE ⚡" });
-});
-
-// ===================================================
-// 📌 GET *LATEST STATUS* OF ALL DEVICES
-// URL: https://api.oathzsecurity.com/status
-// ===================================================
-// =============================
-// LATEST STATUS OF ALL DEVICES
-// =============================
-app.get("/status", (req, res) => {
-  const latest: Record<string, any> = {};
-  const latest = {};
-
-for (const evt of deviceEvents) {
-latest[evt.device_id] = { ...latest[evt.device_id], ...evt };
-}
-
-  const merged = Object.values(latest).map((dev: any) => {
-    const state = getAlertState(dev.device_id);
-  const merged = Object.values(latest).map((dev) => {
-    const st = getAlertState(dev.device_id);
-return {
-...dev,
-      smsSent: state.smsSent,
-      callAttempts: state.callAttempts,
-      callLock: state.callLock,
-      smsSent: st.smsSent,
-      callAttempts: st.callAttempts,
-      callLock: st.callLock,
-};
-});
-
-res.json(merged);
-});
-
-// ===================================================
-// ⭐ CORE ALERT / CALL ENGINE
-//   - DEMO mode compatible
-//   - Always up to 2 calls, then lock
-//   - Max attempts safety cap
-// ===================================================
-async function runAlertEngine(payload: any) {
-// =============================
-// ALERT ENGINE
-// =============================
-async function runAlertEngine(payload) {
-const {
-device_id,
-event_type,
-@@ -129,7 +114,6 @@ async function runAlertEngine(payload: any) {
-
-const st = getAlertState(device_id);
-
-  // Nice structured log like your old one
-console.log("📡 Incoming event:", {
-device_id,
-event_type,
-@@ -140,19 +124,15 @@ async function runAlertEngine(payload: any) {
-longitude,
-});
-
-  // Only trigger engine when movement is confirmed OR we're in demo chase mode
-const isMovementEvent =
-movement_confirmed === true ||
-event_type === "movement" ||
-state === "demo_chase";
-
-  if (!isMovementEvent) {
-    return;
-  }
-  if (!isMovementEvent) return;
-
-console.log(`🚨 MOVEMENT EVENT for ${device_id}`);
-
-  // 2️⃣ CALL ENGINE — ALWAYS 2 CALLS
-if (!twilioClient || !TWIML_VOICE_URL || !ALERT_PHONE || !TWILIO_FROM) {
-console.log("⚠️ Call engine prerequisites missing — skip calls");
-return;
-@@ -183,7 +163,7 @@ async function runAlertEngine(payload: any) {
-to: ALERT_PHONE,
-from: TWILIO_FROM,
-url: TWIML_VOICE_URL,
-      statusCallback: process.env.TWILIO_STATUS_CALLBACK_URL, // optional
-      statusCallback: process.env.TWILIO_STATUS_CALLBACK_URL,
-statusCallbackEvent: ["completed"],
-machineDetection: "Enable",
-});
-@@ -194,22 +174,19 @@ async function runAlertEngine(payload: any) {
-}
-}
-
-// ===================================================
-// 📌 DEVICE POSTS EVENT DATA → BACKEND
-// URL: https://api.oathzsecurity.com/event
-// ===================================================
-// =============================
-// DEVICE POSTS EVENT
+// EVENT INGEST + CHASE DETECTION
 // =============================
 app.post("/event", async (req, res) => {
-try {
-const payload = req.body;
+  const { device_id, latitude, longitude, timestamp } = req.body;
 
-payload.last_seen = new Date().toISOString();
+  console.log("📥 EVENT:", req.body);
 
-    // Store full history
-deviceEvents.push(payload);
+  if (!device_id) {
+    return res.status(400).json({ error: "Missing device_id" });
+  }
 
-console.log("📥 EVENT:", payload.device_id, payload.event_type);
+  // DB insert
+  try {
+    await db.query(
+      `INSERT INTO events (device_id, latitude, longitude, timestamp)
+       VALUES ($1, $2, $3, $4)`,
+      [
+        device_id,
+        latitude || null,
+        longitude || null,
+        timestamp || new Date().toISOString(),
+      ]
+    );
+  } catch (err) {
+    console.error("❌ DB INSERT FAILED:", err);
+  }
 
-    // Run alert engine (movement / demo mode / calls, etc.)
-await runAlertEngine(payload);
+  // DEVICE ONLINE/OFFLINE STATE
+  const state = deviceState[device_id] || {
+    lastMode: "OFFLINE",
+    lastLat: null,
+    lastLon: null,
+    lastTimestamp: null,
+  };
 
-res.json({ ok: true });
-@@ -219,20 +196,18 @@ app.post("/event", async (req, res) => {
-}
-});
+  const nowTs = new Date(timestamp).getTime();
+  state.lastTimestamp = nowTs;
 
-// ===================================================
-// 📌 GET FULL EVENT HISTORY FOR ONE DEVICE
-// URL: https://api.oathzsecurity.com/device/:id/events
-// ===================================================
-// =============================
-// FULL HISTORY FOR ONE DEVICE
-// =============================
-app.get("/device/:id/events", (req, res) => {
-const id = req.params.id;
-const history = deviceEvents.filter((e) => e.device_id === id);
-res.json(history);
-});
+  const hasGPS =
+    latitude !== null &&
+    longitude !== null &&
+    !isNaN(latitude) &&
+    !isNaN(longitude);
 
-// ===================================================
-// 📌 RESET ALERT ENGINE
-// URL: POST /device/:id/reset
-// ===================================================
-// =============================
-// RESET ALERT ENGINE
-// =============================
-app.post("/device/:id/reset", (req, res) => {
-const id = req.params.id;
+  if (!hasGPS) {
+    deviceState[device_id] = state;
+    return res.json({ status: "ok" });
+  }
 
-@@ -249,23 +224,20 @@ app.post("/device/:id/reset", (req, res) => {
-res.json({ ok: true, device_id: id });
-});
+  const isOnline = Date.now() - nowTs < 20000;
 
-// ============================================================
-// ☎️ TWILIO CALLBACK — LOCK ONLY REAL HUMAN ANSWERS
-// URL: POST /twilio/voice-status
-// ============================================================
-// =============================
-// TWILIO CALLBACK — lock only real answers
-// =============================
-app.post("/twilio/voice-status", (req, res) => {
-try {
-const status = req.body.CallStatus;
-    const sid = req.body.CallSid;
-const duration = parseInt(req.body.CallDuration || "0", 10);
-    const sid = req.body.CallSid;
+  if (!isOnline) {
+    state.lastMode = "OFFLINE";
+    deviceState[device_id] = state;
+    return res.json({ status: "ok" });
+  }
 
-console.log("📞 CALL CALLBACK:", { status, duration, sid });
+  // MOVE DETECTION
+  let isChase = false;
 
-    // Lock ONLY when:
-    //   STATUS === completed
-    //   DURATION ≥ 2 seconds
-if (status === "completed" && duration >= 2) {
-console.log("🛑 REAL HUMAN ANSWER DETECTED — CALL ENGINE LOCKED");
+  if (state.lastLat !== null && state.lastLon !== null) {
+    const moved = distanceMeters(
+      state.lastLat,
+      state.lastLon,
+      latitude,
+      longitude
+    );
 
-Object.keys(alertState).forEach((id) => {
-alertState[id].callLock = true;
-});
-@@ -280,33 +252,24 @@ app.post("/twilio/voice-status", (req, res) => {
-}
-});
-
-// ======================================================
-// ⭐ EMAIL NOTIFY LIST — FILE STORAGE (emails.json)
-// ======================================================
-// =============================
-// EMAIL STORAGE
-// =============================
-const emailsFile = path.join(process.cwd(), "emails.json");
-
-// Create file if missing
-if (!fs.existsSync(emailsFile)) {
-  fs.writeFileSync(emailsFile, "[]");
-}
-if (!fs.existsSync(emailsFile)) fs.writeFileSync(emailsFile, "[]");
-
-// ======================================================
-// 📌 NOTIFY ROUTE — Add subscriber
-// URL: POST https://api.oathzsecurity.com/notify
-// ======================================================
-app.post("/notify", (req, res) => {
-try {
-const { email } = req.body;
-
-    if (!email || !email.includes("@")) {
-    if (!email || !email.includes("@"))
-return res.status(400).json({ error: "Invalid email" });
+    if (moved >= 10) {
+      isChase = true;
     }
+  }
 
-const raw = fs.readFileSync(emailsFile, "utf8");
-const list = JSON.parse(raw);
+  state.lastLat = latitude;
+  state.lastLon = longitude;
 
-    if (list.some((x: any) => x.email === email)) {
-      return res.status(200).json({ message: "Already subscribed" });
-    if (list.some((x) => x.email === email)) {
-      return res.json({ message: "Already subscribed" });
-}
+  const previousMode = state.lastMode;
+  const nextMode = isChase ? "CHASE" : "HEARTBEAT";
 
-list.push({
-@@ -317,68 +280,42 @@ app.post("/notify", (req, res) => {
-fs.writeFileSync(emailsFile, JSON.stringify(list, null, 2));
+  state.lastMode = nextMode;
+  deviceState[device_id] = state;
 
-console.log("📨 NEW SUBSCRIBER:", email);
+  // TWILIO ALERT: transition into chase
+  if (previousMode !== "CHASE" && nextMode === "CHASE") {
+    console.log(`🚨 CHASE MODE ACTIVATED for ${device_id}`);
 
-res.json({ message: "Subscribed successfully" });
+    console.log("📞 Sending Twilio CALL...");
+    twilioClient.calls
+      .create({
+        url: "https://api.oathzsecurity.com/twilio/voice",
+        to: ALERT_PHONE,
+        from: FROM_NUMBER,
+      })
+      .then((call) => console.log("📞 Call SID:", call.sid))
+      .catch((err) => console.error("❌ CALL ERROR:", err));
+
+    console.log("📩 Sending Twilio SMS…");
+    twilioClient.messages
+      .create({
+        body: `TRACKBLOCK ALERT: ${device_id} has entered CHASE MODE.`,
+        to: ALERT_PHONE,
+        from: FROM_NUMBER,
+      })
+      .then((msg) => console.log("📩 SMS SID:", msg.sid))
+      .catch((err) => console.error("❌ SMS ERROR:", err));
+  }
+
+  res.json({ status: "ok" });
+});
+
+// =============================
+// GET /devices
+// DEVICES LIST
+// =============================
+app.get("/devices", async (req, res) => {
+try {
+@@ -453,13 +199,12 @@ app.get("/devices", async (req, res) => {
+   `);
+res.json(result.rows);
 } catch (err) {
-console.error("Notify Error:", err);
-res.status(500).json({ error: "Server error" });
+    console.error("❌ devices error:", err);
+res.status(500).json({ error: "Failed to fetch devices" });
 }
 });
 
-// ======================================================
-// ⭐ ADMIN ROUTES — protected with ADMIN_KEY
-// ======================================================
 // =============================
-// ADMIN ROUTES
+// GET /device/:id/events
+// DEVICE EVENT HISTORY
 // =============================
-const ADMIN_KEY = process.env.ADMIN_KEY || "dev-admin-key";
-
-function requireAdmin(req: any, res: any, next: any) {
-function requireAdmin(req, res, next) {
-const key = req.query.key;
-  if (!key || key !== ADMIN_KEY) {
-    return res.status(403).json({ error: "Forbidden" });
-  }
-  if (!key || key !== ADMIN_KEY) return res.status(403).json({ error: "Forbidden" });
-next();
+app.get("/device/:id/events", async (req, res) => {
+try {
+@@ -471,18 +216,10 @@ app.get("/device/:id/events", async (req, res) => {
+);
+res.json(result.rows);
+} catch (err) {
+    console.error("❌ events error:", err);
+res.status(500).json({ error: "Failed to fetch events" });
 }
-
-// ======================================================
-// 📌 VIEW SUBSCRIBERS (JSON)
-// ======================================================
-app.get("/subscribers", requireAdmin, (req, res) => {
-  try {
-    const raw = fs.readFileSync(emailsFile, "utf8");
-    const list = JSON.parse(raw);
-    res.json(list);
-  } catch (err) {
-    console.error("SUBSCRIBERS ERROR:", err);
-    res.status(500).json({ error: "Failed to read subscribers" });
-  }
-  const raw = fs.readFileSync(emailsFile, "utf8");
-  res.json(JSON.parse(raw));
 });
 
-// ======================================================
-// 📌 EXPORT SUBSCRIBERS CSV
-// ======================================================
-app.get("/export-subscribers", requireAdmin, (req, res) => {
-  try {
-    const raw = fs.readFileSync(emailsFile, "utf8");
-    const list = JSON.parse(raw);
-  const raw = fs.readFileSync(emailsFile, "utf8");
-  const list = JSON.parse(raw);
-
-    const csv = ["email,date", ...list.map((i: any) => `${i.email},${i.date}`)].join(
-      "\n"
-    );
-  const csv = ["email,date", ...list.map((i) => `${i.email},${i.date}`)].join("\n");
-
-    res.setHeader("Content-Type", "text/csv");
-    res.setHeader(
-      "Content-Disposition",
-      "attachment; filename=subscribers.csv"
-    );
-
-    res.send(csv);
-  } catch (err) {
-    console.error("CSV EXPORT ERROR:", err);
-    res.status(500).json({ error: "Failed to export subscribers" });
-  }
-  res.setHeader("Content-Type", "text/csv");
-  res.setHeader("Content-Disposition", "attachment; filename=subscribers.csv");
-  res.send(csv);
+// =============================
+app.get("/test-log", (req, res) => {
+  res.json({ ok: true });
 });
 
-// ======================================================
-// 🚀 SERVER START
-// ======================================================
 // =============================
-// START SERVER
-// =============================
-const port = process.env.PORT || 8080;
-app.listen(port, () => console.log(`🚀 Trackblock backend running on ${port}`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () =>
+  console.log(`🚀 Backend running on port ${PORT}`)
+);
+app.listen(PORT, () => console.log(`🚀 Backend running on port ${PORT}`));
