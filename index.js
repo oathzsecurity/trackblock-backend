@@ -77,7 +77,7 @@ app.get("/", (req, res) => {
 // EVENT INGEST
 // ------------------------------------
 app.post("/event", async (req, res) => {
-  const { device_id, latitude, longitude, timestamp } = req.body;
+  const { device_id, latitude, longitude, timestamp, state, movement_confirmed, event_type } = req.body;
 
   console.log("📥 EVENT:", req.body);
 
@@ -98,16 +98,17 @@ app.post("/event", async (req, res) => {
     console.error("❌ DB INSERT FAILED:", err);
   }
 
-  const state =
+  const st =
     deviceState[device_id] || {
       lastMode: "OFFLINE",
       lastLat: null,
       lastLon: null,
       lastTimestamp: null,
+      chaseFired: false,
     };
 
   const nowTs = new Date(timestamp || Date.now()).getTime();
-  state.lastTimestamp = nowTs;
+  st.lastTimestamp = nowTs;
 
   const hasGPS =
     latitude !== null &&
@@ -116,52 +117,60 @@ app.post("/event", async (req, res) => {
     !isNaN(longitude);
 
   if (!hasGPS) {
-    deviceState[device_id] = state;
+    deviceState[device_id] = st;
     return res.json({ status: "ok" });
   }
 
   const isOnline = Date.now() - nowTs < 20000;
 
   if (!isOnline) {
-    state.lastMode = "OFFLINE";
-    deviceState[device_id] = state;
+    st.lastMode = "OFFLINE";
+    deviceState[device_id] = st;
     return res.json({ status: "ok" });
   }
 
-  let isChase = false;
+  let hasMoved = false;
 
-  if (state.lastLat !== null && state.lastLon !== null) {
+  if (st.lastLat !== null && st.lastLon !== null) {
     const moved = distanceMeters(
-      state.lastLat,
-      state.lastLon,
+      st.lastLat,
+      st.lastLon,
       latitude,
       longitude
     );
-    if (moved >= 10) isChase = true;
+    if (moved >= 10) hasMoved = true;
   }
 
-  state.lastLat = latitude;
-  state.lastLon = longitude;
+  st.lastLat = latitude;
+  st.lastLon = longitude;
 
-  const previousMode = state.lastMode;
-  const nextMode = isChase ? "CHASE" : "HEARTBEAT";
+  const previousMode = st.lastMode;
+  const nextMode = hasMoved ? "CHASE" : "HEARTBEAT";
+  st.lastMode = nextMode;
 
-  state.lastMode = nextMode;
-  deviceState[device_id] = state;
+  // ======================================================
+  // ⭐ NEW SAFE CHASE LOGIC
+  // – Only fire Twilio if:
+  //   1. device state == demo_chase  (device says it's in chase)
+  //   2. movement_confirmed == true (device verified movement)
+  //   3. chase alert wasn't fired before
+  // ======================================================
+  const isRealChase =
+       (state === "demo_chase" || event_type === "demo_chase_update")
+    && movement_confirmed === true
+    && st.chaseFired === false;
 
-  // ------------------------------------
-  // Twilio Alerts
-  // ------------------------------------
   if (
-    previousMode !== "CHASE" &&
-    nextMode === "CHASE" &&
+    isRealChase &&
     TWILIO_SID &&
     TWILIO_TOKEN &&
     ALERT_PHONE &&
     FROM_NUMBER
   ) {
-    console.log(`🚨 CHASE MODE ACTIVATED for ${device_id}`);
+    console.log(`🚨 REAL CHASE ACTIVATED for ${device_id}`);
+    st.chaseFired = true;
 
+    // ===== CALL =====
     twilioClient.calls
       .create({
         url: "https://trackblock-backend-production.up.railway.app/twilio/voice",
@@ -171,6 +180,7 @@ app.post("/event", async (req, res) => {
       .then((call) => console.log("📞 Call SID:", call.sid))
       .catch((err) => console.error("❌ CALL ERROR:", err));
 
+    // ===== SMS =====
     twilioClient.messages
       .create({
         body: `Your Trackblock ${device_id} is on the move! Dashboard: https://dashboard.oathzsecurity.com/devices/${device_id}`,
@@ -181,8 +191,11 @@ app.post("/event", async (req, res) => {
       .catch((err) => console.error("❌ SMS ERROR:", err));
   }
 
+  deviceState[device_id] = st;
+
   res.json({ status: "ok" });
 });
+
 // ------------------------------------
 // TWILIO VOICE WEBHOOK
 // ------------------------------------
