@@ -45,7 +45,7 @@ const FROM_NUMBER = process.env.FROM_NUMBER || "";
 
 const twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
 
-if (!TWILIO_SID || !TWILIO_TOKEN) console.warn("⚠ Missing Twilio SID/TOKEN");
+if (!TWILIO_SID || !TWILIO_TOKEN) console.warn("⚠ Missing Twilio credentials");
 if (!ALERT_PHONE || !FROM_NUMBER) console.warn("⚠ Missing phone numbers");
 
 // ------------------------------------
@@ -60,14 +60,12 @@ function distanceMeters(lat1, lon1, lat2, lon2) {
   const dLon = toRad(lon2 - lon1);
   const a =
     Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) *
-      Math.cos(toRad(lat2)) *
-      Math.sin(dLon / 2) ** 2;
-  return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
 // ------------------------------------
-// Root
+// ROOT
 // ------------------------------------
 app.get("/", (req, res) => {
   res.json({ status: "Trackblock backend running" });
@@ -77,12 +75,24 @@ app.get("/", (req, res) => {
 // EVENT INGEST
 // ------------------------------------
 app.post("/event", async (req, res) => {
-  const { device_id, latitude, longitude, timestamp, state, movement_confirmed, event_type } = req.body;
+  const {
+    device_id,
+    latitude,
+    longitude,
+    timestamp,
+    state,
+    movement_confirmed,
+    event_type,
+    battery_voltage
+  } = req.body;
 
   console.log("📥 EVENT:", req.body);
 
   if (!device_id) return res.status(400).json({ error: "Missing device_id" });
 
+  // ------------------------------------
+  // DB INSERT
+  // ------------------------------------
   try {
     await db.query(
       `INSERT INTO events (device_id, latitude, longitude, timestamp)
@@ -98,6 +108,9 @@ app.post("/event", async (req, res) => {
     console.error("❌ DB INSERT FAILED:", err);
   }
 
+  // ------------------------------------
+  // Load or create device state
+  // ------------------------------------
   const st =
     deviceState[device_id] || {
       lastMode: "OFFLINE",
@@ -105,6 +118,7 @@ app.post("/event", async (req, res) => {
       lastLon: null,
       lastTimestamp: null,
       chaseFired: false,
+      lowBatterySent: false, // new!
     };
 
   const nowTs = new Date(timestamp || Date.now()).getTime();
@@ -116,21 +130,22 @@ app.post("/event", async (req, res) => {
     !isNaN(latitude) &&
     !isNaN(longitude);
 
+  // If no GPS, just store state and exit
   if (!hasGPS) {
     deviceState[device_id] = st;
     return res.json({ status: "ok" });
   }
 
+  // Determine if device is online
   const isOnline = Date.now() - nowTs < 20000;
-
   if (!isOnline) {
     st.lastMode = "OFFLINE";
     deviceState[device_id] = st;
     return res.json({ status: "ok" });
   }
 
+  // Determine movement
   let hasMoved = false;
-
   if (st.lastLat !== null && st.lastLon !== null) {
     const moved = distanceMeters(
       st.lastLat,
@@ -144,17 +159,48 @@ app.post("/event", async (req, res) => {
   st.lastLat = latitude;
   st.lastLon = longitude;
 
-  const previousMode = st.lastMode;
   const nextMode = hasMoved ? "CHASE" : "HEARTBEAT";
   st.lastMode = nextMode;
 
-  // ======================================================
-  // ⭐ NEW SAFE CHASE LOGIC
-  // – Only fire Twilio if:
-  //   1. device state == demo_chase  (device says it's in chase)
-  //   2. movement_confirmed == true (device verified movement)
-  //   3. chase alert wasn't fired before
-  // ======================================================
+  // ------------------------------------
+  // 🔋 LOW BATTERY ALERT
+  // ------------------------------------
+  try {
+    const lowThreshold = 12.0;     // send alert under this voltage
+    const recoverThreshold = 12.5; // reset alert above this voltage
+
+    const batt = Number(battery_voltage);
+
+    if (!isNaN(batt)) {
+      if (batt < lowThreshold && !st.lowBatterySent) {
+        console.log(`🔋 LOW BATTERY for ${device_id}: ${batt.toFixed(2)}V`);
+
+        twilioClient.messages
+          .create({
+            body: `⚠️ Trackblock ${device_id} battery is LOW (${batt.toFixed(
+              2
+            )}V). Please replace or recharge as soon as possible.`,
+            to: ALERT_PHONE,
+            from: FROM_NUMBER,
+          })
+          .then((msg) => console.log("📩 Low batt SMS SID:", msg.sid))
+          .catch((err) => console.error("❌ Low batt SMS ERROR:", err));
+
+        st.lowBatterySent = true;
+      }
+
+      if (batt >= recoverThreshold && st.lowBatterySent) {
+        console.log(`🔋 Battery recovered for ${device_id}, reset alert.`);
+        st.lowBatterySent = false;
+      }
+    }
+  } catch (err) {
+    console.error("❌ Low battery handler error:", err);
+  }
+
+  // ------------------------------------
+  // 🚨 REAL CHASE LOGIC
+  // ------------------------------------
   const isRealChase =
        (state === "demo_chase" || event_type === "demo_chase_update")
     && movement_confirmed === true
@@ -170,28 +216,27 @@ app.post("/event", async (req, res) => {
     console.log(`🚨 REAL CHASE ACTIVATED for ${device_id}`);
     st.chaseFired = true;
 
-    // ===== CALL =====
-  // 1️⃣ FIRST CALL IMMEDIATELY
-twilioClient.calls
-  .create({
-    url: "https://trackblock-backend-production.up.railway.app/twilio/voice",
-    to: ALERT_PHONE,
-    from: FROM_NUMBER,
-  })
-  .then((call) => console.log("📞 CALL #1 SID:", call.sid))
-  .catch((err) => console.error("❌ CALL #1 ERROR:", err));
+    // ===== CALL #1 =====
+    twilioClient.calls
+      .create({
+        url: "https://trackblock-backend-production.up.railway.app/twilio/voice",
+        to: ALERT_PHONE,
+        from: FROM_NUMBER,
+      })
+      .then((call) => console.log("📞 CALL #1 SID:", call.sid))
+      .catch((err) => console.error("❌ CALL #1 ERROR:", err));
 
-// 2️⃣ SECOND CALL AFTER 8 SECONDS
-setTimeout(() => {
-  twilioClient.calls
-    .create({
-      url: "https://trackblock-backend-production.up.railway.app/twilio/voice",
-      to: ALERT_PHONE,
-      from: FROM_NUMBER,
-    })
-    .then((call) => console.log("📞 CALL #2 SID:", call.sid))
-    .catch((err) => console.error("❌ CALL #2 ERROR:", err));
-}, 12000); // 12 seconds delay
+    // ===== CALL #2 =====
+    setTimeout(() => {
+      twilioClient.calls
+        .create({
+          url: "https://trackblock-backend-production.up.railway.app/twilio/voice",
+          to: ALERT_PHONE,
+          from: FROM_NUMBER,
+        })
+        .then((call) => console.log("📞 CALL #2 SID:", call.sid))
+        .catch((err) => console.error("❌ CALL #2 ERROR:", err));
+    }, 12000);
 
     // ===== SMS =====
     twilioClient.messages
@@ -213,35 +258,14 @@ setTimeout(() => {
 // TWILIO VOICE WEBHOOK
 // ------------------------------------
 app.post("/twilio/voice", (req, res) => {
-  const deviceId = req.query.device_id || "your Trackblock";
-
   res.type("text/xml");
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="man">
     Trackblock is on the move. Check your dashboard now for current live position.
-    Alert the authorities — call the police.
+    Alert the authorities immediately.
     Repeat. Trackblock is on the move.
-    Trackblock is on the move. Check your dashboard now.
-    Alert authorities immediately. Repeat. Trackblock is on the move.
   </Say>
-</Response>`);
-});
-
-// ------------------------------------
-// TWILIO SMS WEBHOOK (optional)
-// ------------------------------------
-app.post("/twilio/sms", (req, res) => {
-  const deviceId = req.query.device_id || "unknown";
-  const link = `https://dashboard.oathzsecurity.com/devices/${deviceId}`;
-
-  res.type("text/xml");
-  res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Message>
-    Your Trackblock is on the move! Check your dashboard NOW for current live position.
-    ${link}
-  </Message>
 </Response>`);
 });
 
