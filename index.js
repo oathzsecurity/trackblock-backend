@@ -171,14 +171,27 @@ app.post("/event", async (req, res) => {
     st.chaseFired = true;
 
     // ===== CALL =====
-    twilioClient.calls
-      .create({
-        url: "https://trackblock-backend-production.up.railway.app/twilio/voice",
-        to: ALERT_PHONE,
-        from: FROM_NUMBER,
-      })
-      .then((call) => console.log("📞 Call SID:", call.sid))
-      .catch((err) => console.error("❌ CALL ERROR:", err));
+  // 1️⃣ FIRST CALL IMMEDIATELY
+twilioClient.calls
+  .create({
+    url: "https://trackblock-backend-production.up.railway.app/twilio/voice",
+    to: ALERT_PHONE,
+    from: FROM_NUMBER,
+  })
+  .then((call) => console.log("📞 CALL #1 SID:", call.sid))
+  .catch((err) => console.error("❌ CALL #1 ERROR:", err));
+
+// 2️⃣ SECOND CALL AFTER 8 SECONDS
+setTimeout(() => {
+  twilioClient.calls
+    .create({
+      url: "https://trackblock-backend-production.up.railway.app/twilio/voice",
+      to: ALERT_PHONE,
+      from: FROM_NUMBER,
+    })
+    .then((call) => console.log("📞 CALL #2 SID:", call.sid))
+    .catch((err) => console.error("❌ CALL #2 ERROR:", err));
+}, 12000); // 12 seconds delay
 
     // ===== SMS =====
     twilioClient.messages
