@@ -2,12 +2,10 @@ import express from "express";
 import cors from "cors";
 import twilio from "twilio";
 import pg from "pg";
+import crypto from "crypto";   // ⭐ needed for UUID
 
 const app = express();
 
-// ------------------------------------
-// Middleware
-// ------------------------------------
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
@@ -45,7 +43,7 @@ const FROM_NUMBER = process.env.FROM_NUMBER || "";
 
 const twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
 
-if (!TWILIO_SID || !TWILIO_TOKEN) console.warn("⚠ Missing Twilio credentials");
+if (!TWILIO_SID || !TWILIO_TOKEN) console.warn("⚠ Missing Twilio SID/TOKEN");
 if (!ALERT_PHONE || !FROM_NUMBER) console.warn("⚠ Missing phone numbers");
 
 // ------------------------------------
@@ -60,12 +58,14 @@ function distanceMeters(lat1, lon1, lat2, lon2) {
   const dLon = toRad(lon2 - lon1);
   const a =
     Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) ** 2;
+  return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 }
 
 // ------------------------------------
-// ROOT
+// Root
 // ------------------------------------
 app.get("/", (req, res) => {
   res.json({ status: "Trackblock backend running" });
@@ -83,30 +83,12 @@ app.post("/event", async (req, res) => {
     state,
     movement_confirmed,
     event_type,
-    battery_voltage
+    battery_voltage,
   } = req.body;
 
   console.log("📥 EVENT:", req.body);
 
   if (!device_id) return res.status(400).json({ error: "Missing device_id" });
-
-  // ------------------------------------
-  // DB INSERT
-  // ------------------------------------
-  try {
-    await db.query(
-      `INSERT INTO events (device_id, latitude, longitude, timestamp)
-       VALUES ($1, $2, $3, $4)`,
-      [
-        device_id,
-        latitude || null,
-        longitude || null,
-        timestamp || new Date().toISOString(),
-      ]
-    );
-  } catch (err) {
-    console.error("❌ DB INSERT FAILED:", err);
-  }
 
   // ------------------------------------
   // Load or create device state
@@ -118,7 +100,8 @@ app.post("/event", async (req, res) => {
       lastLon: null,
       lastTimestamp: null,
       chaseFired: false,
-      lowBatterySent: false, // new!
+      chaseSessionId: null, // ⭐ NEW
+      lowBatterySent: false,
     };
 
   const nowTs = new Date(timestamp || Date.now()).getTime();
@@ -130,22 +113,24 @@ app.post("/event", async (req, res) => {
     !isNaN(latitude) &&
     !isNaN(longitude);
 
-  // If no GPS, just store state and exit
   if (!hasGPS) {
     deviceState[device_id] = st;
     return res.json({ status: "ok" });
   }
 
-  // Determine if device is online
   const isOnline = Date.now() - nowTs < 20000;
+
   if (!isOnline) {
     st.lastMode = "OFFLINE";
     deviceState[device_id] = st;
     return res.json({ status: "ok" });
   }
 
-  // Determine movement
+  // ------------------------------------
+  // MOVEMENT DETECTION
+  // ------------------------------------
   let hasMoved = false;
+
   if (st.lastLat !== null && st.lastLon !== null) {
     const moved = distanceMeters(
       st.lastLat,
@@ -163,12 +148,24 @@ app.post("/event", async (req, res) => {
   st.lastMode = nextMode;
 
   // ------------------------------------
-  // 🔋 LOW BATTERY ALERT
+  // ⭐ CHASE SESSION HANDLING
+  // ------------------------------------
+  const chaseStarted =
+    (state === "demo_chase" || event_type === "demo_chase_update") &&
+    movement_confirmed === true &&
+    st.chaseSessionId === null;
+
+  if (chaseStarted) {
+    st.chaseSessionId = crypto.randomUUID();
+    console.log(`🎯 New chase session for ${device_id}: ${st.chaseSessionId}`);
+  }
+
+  // ------------------------------------
+  // 🔋 LOW BATTERY ALERTS
   // ------------------------------------
   try {
-    const lowThreshold = 12.0;     // send alert under this voltage
-    const recoverThreshold = 12.5; // reset alert above this voltage
-
+    const lowThreshold = 12.0;
+    const recoverThreshold = 12.5;
     const batt = Number(battery_voltage);
 
     if (!isNaN(batt)) {
@@ -190,7 +187,6 @@ app.post("/event", async (req, res) => {
       }
 
       if (batt >= recoverThreshold && st.lowBatterySent) {
-        console.log(`🔋 Battery recovered for ${device_id}, reset alert.`);
         st.lowBatterySent = false;
       }
     }
@@ -202,9 +198,9 @@ app.post("/event", async (req, res) => {
   // 🚨 REAL CHASE LOGIC
   // ------------------------------------
   const isRealChase =
-       (state === "demo_chase" || event_type === "demo_chase_update")
-    && movement_confirmed === true
-    && st.chaseFired === false;
+    (state === "demo_chase" || event_type === "demo_chase_update") &&
+    movement_confirmed === true &&
+    st.chaseFired === false;
 
   if (
     isRealChase &&
@@ -216,7 +212,7 @@ app.post("/event", async (req, res) => {
     console.log(`🚨 REAL CHASE ACTIVATED for ${device_id}`);
     st.chaseFired = true;
 
-    // ===== CALL #1 =====
+    // FIRST CALL
     twilioClient.calls
       .create({
         url: "https://trackblock-backend-production.up.railway.app/twilio/voice",
@@ -226,7 +222,7 @@ app.post("/event", async (req, res) => {
       .then((call) => console.log("📞 CALL #1 SID:", call.sid))
       .catch((err) => console.error("❌ CALL #1 ERROR:", err));
 
-    // ===== CALL #2 =====
+    // SECOND CALL 12s later
     setTimeout(() => {
       twilioClient.calls
         .create({
@@ -238,7 +234,7 @@ app.post("/event", async (req, res) => {
         .catch((err) => console.error("❌ CALL #2 ERROR:", err));
     }, 12000);
 
-    // ===== SMS =====
+    // SMS
     twilioClient.messages
       .create({
         body: `Your Trackblock ${device_id} is on the move! Dashboard: https://dashboard.oathzsecurity.com/devices/${device_id}`,
@@ -249,8 +245,26 @@ app.post("/event", async (req, res) => {
       .catch((err) => console.error("❌ SMS ERROR:", err));
   }
 
-  deviceState[device_id] = st;
+  // ------------------------------------
+  // ⭐ INSERT EVENT (NOW WITH SESSION ID!)
+  // ------------------------------------
+  try {
+    await db.query(
+      `INSERT INTO events (device_id, latitude, longitude, timestamp, chase_session_id)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        device_id,
+        latitude || null,
+        longitude || null,
+        timestamp || new Date().toISOString(),
+        st.chaseSessionId || null,
+      ]
+    );
+  } catch (err) {
+    console.error("❌ DB INSERT FAILED:", err);
+  }
 
+  deviceState[device_id] = st;
   res.json({ status: "ok" });
 });
 
@@ -262,9 +276,8 @@ app.post("/twilio/voice", (req, res) => {
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="man">
-    Trackblock is on the move. Check your dashboard now for current live position.
-    Alert the authorities immediately.
-    Repeat. Trackblock is on the move.
+    Trackblock is on the move. Check your dashboard now.
+    Alert authorities immediately.
   </Say>
 </Response>`);
 });
@@ -298,7 +311,6 @@ app.get("/device/:id/events", async (req, res) => {
        ORDER BY timestamp ASC`,
       [req.params.id]
     );
-
     res.json(result.rows);
   } catch (err) {
     console.error("❌ events error:", err);
@@ -307,17 +319,9 @@ app.get("/device/:id/events", async (req, res) => {
 });
 
 // ------------------------------------
-// TEST ENDPOINT
-// ------------------------------------
-app.get("/test-log", (req, res) => {
-  res.json({ ok: true });
-});
-
-// ------------------------------------
 // START SERVER
 // ------------------------------------
 const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`🚀 Backend running on port ${PORT}`);
-});
+app.listen(PORT, () =>
+  console.log(`🚀 Backend running on port ${PORT}`)
+);
