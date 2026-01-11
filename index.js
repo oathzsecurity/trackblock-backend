@@ -302,7 +302,7 @@ app.post("/event", async (req, res) => {
         })
         .then((call) => console.log("📞 CALL #2 SID:", call.sid))
         .catch((err) => console.error("❌ CALL #2 ERROR:", err));
-    }, 12000);
+    }, 25000);
 
     // SMS
     twilioClient.messages
